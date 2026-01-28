@@ -45,7 +45,14 @@ def bootstrap_checks():
     logger.info("=== TRKD BOOTSTRAP SUCCESS ===")
 
 
-bootstrap_checks()
+def safe_bootstrap():
+    try:
+        bootstrap_checks()
+    except Exception as e:
+        logger.exception("BOOTSTRAP FAILED (non-fatal)")
+
+
+safe_bootstrap()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
