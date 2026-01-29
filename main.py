@@ -4,6 +4,8 @@ from flask import Flask
 import gspread
 from google.auth import default
 from kiteconnect import KiteConnect
+from kiteconnect import KiteTicker
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -64,7 +66,57 @@ def kite_rest_check():
     instruments = kite.instruments("NFO")
     logger.info(f"NFO instruments loaded: {len(instruments)}")
 
+    tokens = resolve_futures_tokens(kite)
+    start_kite_ticker(kite, tokens)
+
     logger.info("=== KITE REST CHECK SUCCESS ===")
+
+def resolve_futures_tokens(kite):
+    instruments = kite.instruments("NFO")
+
+    nifty_fut = None
+    banknifty_fut = None
+
+    for ins in instruments:
+        if ins["tradingsymbol"].startswith("NIFTY") and ins["instrument_type"] == "FUT":
+            nifty_fut = ins
+        if ins["tradingsymbol"].startswith("BANKNIFTY") and ins["instrument_type"] == "FUT":
+            banknifty_fut = ins
+
+    if not nifty_fut or not banknifty_fut:
+        raise Exception("Could not resolve FUT instruments")
+
+    logger.info(f"NIFTY FUT: {nifty_fut['tradingsymbol']} ({nifty_fut['instrument_token']})")
+    logger.info(f"BANKNIFTY FUT: {banknifty_fut['tradingsymbol']} ({banknifty_fut['instrument_token']})")
+
+    return [
+        nifty_fut["instrument_token"],
+        banknifty_fut["instrument_token"]
+    ]
+
+def start_kite_ticker(kite, tokens):
+    kws = KiteTicker(
+        api_key=os.getenv("KITE_API_KEY"),
+        access_token=os.getenv("KITE_ACCESS_TOKEN")
+    )
+
+    def on_connect(ws, response):
+        logger.info("Kite WebSocket connected")
+        ws.subscribe(tokens)
+        ws.set_mode(ws.MODE_LTP, tokens)
+
+    def on_ticks(ws, ticks):
+        for tick in ticks:
+            logger.info(f"TICK {tick['instrument_token']} LTP={tick['last_price']}")
+
+    def on_close(ws, code, reason):
+        logger.warning(f"Kite WebSocket closed: {code} {reason}")
+
+    kws.on_connect = on_connect
+    kws.on_ticks = on_ticks
+    kws.on_close = on_close
+
+    kws.connect(threaded=True)
 
 
 def safe_bootstrap():
