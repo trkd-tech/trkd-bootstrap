@@ -5,7 +5,7 @@ import gspread
 from google.auth import default
 from kiteconnect import KiteConnect
 from kiteconnect import KiteTicker
-
+from datetime import date
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -88,11 +88,44 @@ def resolve_futures_tokens(kite):
 
     logger.info(f"NIFTY FUT: {nifty_fut['tradingsymbol']} ({nifty_fut['instrument_token']})")
     logger.info(f"BANKNIFTY FUT: {banknifty_fut['tradingsymbol']} ({banknifty_fut['instrument_token']})")
-
+    logger.info(
+    f"Resolved {ins['tradingsymbol']} | "
+    f"Expiry={ins['expiry']} | "
+    f"Token={ins['instrument_token']} | "
+    f"Lot={ins['lot_size']}"
+)
     return [
         nifty_fut["instrument_token"],
         banknifty_fut["instrument_token"]
     ]
+
+
+def resolve_current_month_fut(kite, name):
+    instruments = kite.instruments("NFO")
+
+    futs = [
+        ins for ins in instruments
+        if ins["instrument_type"] == "FUT"
+        and ins["name"] == name
+        and ins["expiry"] >= date.today()
+    ]
+
+    if not futs:
+        raise Exception(f"No FUT found for {name}")
+
+    # sort by nearest expiry
+    futs.sort(key=lambda x: x["expiry"])
+
+    selected = futs[0]
+
+    logger.info(
+        f"Selected {name} FUT → "
+        f"{selected['tradingsymbol']} | "
+        f"Expiry={selected['expiry']} | "
+        f"Token={selected['instrument_token']}"
+    )
+
+    return selected["instrument_token"]
 
 def start_kite_ticker(kite, tokens):
     kws = KiteTicker(
@@ -118,6 +151,10 @@ def start_kite_ticker(kite, tokens):
 
     kws.connect(threaded=True)
 
+nifty_token = resolve_current_month_fut(kite, "NIFTY")
+banknifty_token = resolve_current_month_fut(kite, "BANKNIFTY")
+
+tokens = [nifty_token, banknifty_token]
 
 def safe_bootstrap():
     try:
