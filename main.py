@@ -3,6 +3,7 @@ import logging
 from flask import Flask
 import gspread
 from google.auth import default
+from kiteconnect import KiteConnect
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,6 +46,27 @@ def bootstrap_checks():
     logger.info("=== TRKD BOOTSTRAP SUCCESS ===")
 
 
+def kite_rest_check():
+    logger.info("=== KITE REST CHECK START ===")
+
+    api_key = os.getenv("KITE_API_KEY")
+    access_token = os.getenv("KITE_ACCESS_TOKEN")
+
+    if not api_key or not access_token:
+        raise Exception("Kite credentials missing")
+
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access_token)
+
+    profile = kite.profile()
+    logger.info(f"Kite user: {profile.get('user_name')}")
+
+    instruments = kite.instruments("NFO")
+    logger.info(f"NFO instruments loaded: {len(instruments)}")
+
+    logger.info("=== KITE REST CHECK SUCCESS ===")
+
+
 def safe_bootstrap():
     try:
         bootstrap_checks()
@@ -52,7 +74,6 @@ def safe_bootstrap():
         logger.info("=== BOOTSTRAP + KITE REST CHECK COMPLETED ===")
     except Exception:
         logger.exception("BOOTSTRAP FAILED (non-fatal)")
-
 
 safe_bootstrap()
 
