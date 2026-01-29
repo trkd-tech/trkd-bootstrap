@@ -1,16 +1,17 @@
 import os
 import logging
+from datetime import date
+
 from flask import Flask
 import gspread
 from google.auth import default
-from kiteconnect import KiteConnect
-from kiteconnect import KiteTicker
-from datetime import date
+from kiteconnect import KiteConnect, KiteTicker
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
 
 @app.route("/")
 def health_check():
@@ -29,8 +30,7 @@ def bootstrap_checks():
     logger.info(f"GOOGLE_SHEET_ID set: {sheet_id != 'NOT_SET'}")
 
     for key in ["KITE_API_KEY", "KITE_API_SECRET", "KITE_ACCESS_TOKEN"]:
-        present = os.getenv(key) is not None
-        logger.info(f"Secret {key} present: {present}")
+        logger.info(f"Secret {key} present: {os.getenv(key) is not None}")
 
     creds, _ = default()
     gc = gspread.authorize(creds)
@@ -48,78 +48,33 @@ def bootstrap_checks():
     logger.info("=== TRKD BOOTSTRAP SUCCESS ===")
 
 
-def kite_rest_check():
-    logger.info("=== KITE REST CHECK START ===")
+ALLOWED_FUT_NAMES = {
+    "NIFTY": "NIFTY",
+    "BANKNIFTY": "BANKNIFTY"
+}
 
-    api_key = os.getenv("KITE_API_KEY")
-    access_token = os.getenv("KITE_ACCESS_TOKEN")
 
-    if not api_key or not access_token:
-        raise Exception("Kite credentials missing")
-
-    kite = KiteConnect(api_key=api_key)
-    kite.set_access_token(access_token)
-
-    profile = kite.profile()
-    logger.info(f"Kite user: {profile.get('user_name')}")
-
+def resolve_current_month_fut(kite, index_name):
     instruments = kite.instruments("NFO")
-    logger.info(f"NFO instruments loaded: {len(instruments)}")
+    target_name = ALLOWED_FUT_NAMES[index_name]
 
-    tokens = resolve_futures_tokens(kite)
-    start_kite_ticker(kite, tokens)
-
-    logger.info("=== KITE REST CHECK SUCCESS ===")
-
-def resolve_futures_tokens(kite):
-    instruments = kite.instruments("NFO")
-
-    nifty_fut = None
-    banknifty_fut = None
-
-    for ins in instruments:
-        if ins["tradingsymbol"].startswith("NIFTY") and ins["instrument_type"] == "FUT":
-            nifty_fut = ins
-        if ins["tradingsymbol"].startswith("BANKNIFTY") and ins["instrument_type"] == "FUT":
-            banknifty_fut = ins
-
-    if not nifty_fut or not banknifty_fut:
-        raise Exception("Could not resolve FUT instruments")
-
-    logger.info(f"NIFTY FUT: {nifty_fut['tradingsymbol']} ({nifty_fut['instrument_token']})")
-    logger.info(f"BANKNIFTY FUT: {banknifty_fut['tradingsymbol']} ({banknifty_fut['instrument_token']})")
-    logger.info(
-    f"Resolved {ins['tradingsymbol']} | "
-    f"Expiry={ins['expiry']} | "
-    f"Token={ins['instrument_token']} | "
-    f"Lot={ins['lot_size']}"
-)
-    return [
-        nifty_fut["instrument_token"],
-        banknifty_fut["instrument_token"]
-    ]
-
-
-def resolve_current_month_fut(kite, name):
-    instruments = kite.instruments("NFO")
-
-    futs = [
+    candidates = [
         ins for ins in instruments
-        if ins["instrument_type"] == "FUT"
-        and ins["name"] == name
+        if ins["segment"] == "NFO-FUT"
+        and ins["instrument_type"] == "FUT"
+        and ins["name"] == target_name
+        and ins["tradingsymbol"].startswith(target_name)
         and ins["expiry"] >= date.today()
     ]
 
-    if not futs:
-        raise Exception(f"No FUT found for {name}")
+    if not candidates:
+        raise Exception(f"No valid FUT found for {index_name}")
 
-    # sort by nearest expiry
-    futs.sort(key=lambda x: x["expiry"])
-
-    selected = futs[0]
+    candidates.sort(key=lambda x: x["expiry"])
+    selected = candidates[0]
 
     logger.info(
-        f"Selected {name} FUT → "
+        f"SELECTED FUT → {index_name} | "
         f"{selected['tradingsymbol']} | "
         f"Expiry={selected['expiry']} | "
         f"Token={selected['instrument_token']}"
@@ -127,7 +82,8 @@ def resolve_current_month_fut(kite, name):
 
     return selected["instrument_token"]
 
-def start_kite_ticker(kite, tokens):
+
+def start_kite_ticker(tokens):
     kws = KiteTicker(
         api_key=os.getenv("KITE_API_KEY"),
         access_token=os.getenv("KITE_ACCESS_TOKEN")
@@ -136,11 +92,16 @@ def start_kite_ticker(kite, tokens):
     def on_connect(ws, response):
         logger.info("Kite WebSocket connected")
         ws.subscribe(tokens)
-        ws.set_mode(ws.MODE_LTP, tokens)
+        ws.set_mode(ws.MODE_QUOTE, tokens)
 
     def on_ticks(ws, ticks):
         for tick in ticks:
-            logger.info(f"TICK {tick['instrument_token']} LTP={tick['last_price']}")
+            logger.info(
+                f"TICK {tick['instrument_token']} "
+                f"LTP={tick.get('last_price')} "
+                f"VOL={tick.get('volume_traded', 0)} "
+                f"OI={tick.get('oi', 0)}"
+            )
 
     def on_close(ws, code, reason):
         logger.warning(f"Kite WebSocket closed: {code} {reason}")
@@ -151,10 +112,28 @@ def start_kite_ticker(kite, tokens):
 
     kws.connect(threaded=True)
 
-nifty_token = resolve_current_month_fut(kite, "NIFTY")
-banknifty_token = resolve_current_month_fut(kite, "BANKNIFTY")
 
-tokens = [nifty_token, banknifty_token]
+def kite_rest_check():
+    logger.info("=== KITE REST CHECK START ===")
+
+    api_key = os.getenv("KITE_API_KEY")
+    access_token = os.getenv("KITE_ACCESS_TOKEN")
+
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access_token)
+
+    profile = kite.profile()
+    logger.info(f"Kite user: {profile.get('user_name')}")
+
+    logger.info(f"NFO instruments loaded: {len(kite.instruments('NFO'))}")
+
+    nifty_token = resolve_current_month_fut(kite, "NIFTY")
+    banknifty_token = resolve_current_month_fut(kite, "BANKNIFTY")
+
+    start_kite_ticker([nifty_token, banknifty_token])
+
+    logger.info("=== KITE REST CHECK SUCCESS ===")
+
 
 def safe_bootstrap():
     try:
@@ -164,8 +143,8 @@ def safe_bootstrap():
     except Exception:
         logger.exception("BOOTSTRAP FAILED (non-fatal)")
 
+
 safe_bootstrap()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
-
