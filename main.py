@@ -37,6 +37,32 @@ opening_range = {
     # }
 }
 
+# ===== STRATEGY STATE =====
+strategy_state = {
+    # token: {
+    #   "signal": None,
+    #   "triggered": False
+    # }
+}
+
+
+# ===== PAPER TRADING STATE =====
+
+positions = {
+    # token: {
+    #   "direction": "LONG" / "SHORT",
+    #   "entry_price": float,
+    #   "entry_time": datetime,
+    #   "qty": int,
+    #   "open": bool
+    # }
+}
+
+PAPER_QTY = {
+    "NIFTY": 50,
+    "BANKNIFTY": 15
+}
+
 
 # ================== LOGGING ==================
 
@@ -234,6 +260,8 @@ def aggregate_5m_from_1m(token, closed_minute):
     log_closed_5m_candle(token, candles_5m[key_5m])
     update_vwap(token, candles_5m[key_5m])
     update_opening_range(token, candles_5m[key_5m])
+    evaluate_orb_breakout(token, candles_5m[key_5m])
+
 
 # ================== Open Range Logger ==================
 def log_opening_range(token, state):
@@ -350,6 +378,55 @@ def backfill_opening_range(kite, token):
 
     logger.info(
         f"OPENING RANGE BACKFILLED | token={token} | HIGH={high} LOW={low}"
+    )
+
+
+# ================== Opening Range Breakout Evaluation function  ==================
+def evaluate_orb_breakout(token, candle_5m):
+    """
+    VWAP + Opening Range breakout logic.
+    Signal fires at most once per instrument per day.
+    """
+    or_state = opening_range.get(token)
+    vwap_info = vwap_state.get(token)
+
+    if not or_state or not or_state.get("finalized"):
+        return
+
+    if not vwap_info or not vwap_info.get("vwap"):
+        return
+
+    state = strategy_state.get(token)
+    if state and state.get("triggered"):
+        return  # already triggered today
+
+    close = candle_5m["close"]
+    vwap = vwap_info["vwap"]
+
+    signal = None
+
+    if close > or_state["high"] and close > vwap:
+        signal = "LONG"
+
+    elif close < or_state["low"] and close < vwap:
+        signal = "SHORT"
+
+    if signal:
+        strategy_state[token] = {
+            "signal": signal,
+            "triggered": True
+        }
+
+        log_signal(token, signal, candle_5m)
+        paper_enter_position(token, signal, candle_5m)
+
+# ================== Signal Logger ==================
+def log_signal(token, signal, candle):
+    logger.info(
+        f"SIGNAL GENERATED | token={token} | "
+        f"TYPE={signal} | "
+        f"CANDLE={candle['start']} | "
+        f"CLOSE={candle['close']}"
     )
 
 
