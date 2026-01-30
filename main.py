@@ -16,6 +16,10 @@ tick_engine_started = False
 # {(instrument_token, minute_start): candle_dict}
 candles_1m = {}
 
+# Track A: realtime 5-minute candles
+# {(instrument_token, five_min_start): candle_dict}
+candles_5m = {}
+
 # Track last seen minute per instrument
 last_minute_seen = {}
 
@@ -113,7 +117,8 @@ def detect_minute_close(token, current_minute):
 
         if closed_candle:
             log_closed_1m_candle(token, closed_candle)
-
+            aggregate_5m_from_1m(token, last_minute)
+      
         last_minute_seen[token] = current_minute
 
 def process_tick_to_1m(tick):
@@ -160,6 +165,60 @@ def log_closed_1m_candle(token, candle):
         f"C={candle['close']} "
         f"V={candle['volume']}"
     )
+
+# ================== 5 Min logger ==================
+def log_closed_5m_candle(token, candle):
+    logger.info(
+        f"5M CLOSED | token={token} | "
+        f"{candle['start']} | "
+        f"O={candle['open']} "
+        f"H={candle['high']} "
+        f"L={candle['low']} "
+        f"C={candle['close']} "
+        f"V={candle['volume']}"
+    )
+
+
+# ================== 5 Min aggregation logic ==================
+def aggregate_5m_from_1m(token, closed_minute):
+    """
+    Build a 5-minute candle once all 5 underlying 1-minute candles exist.
+    """
+    five_min_start = closed_minute.replace(
+        minute=(closed_minute.minute // 5) * 5,
+        second=0,
+        microsecond=0
+    )
+
+    key_5m = (token, five_min_start)
+
+    if key_5m in candles_5m:
+        return  # already built
+
+    minutes = [
+        five_min_start + timedelta(minutes=i)
+        for i in range(5)
+    ]
+
+    one_min_candles = []
+    for m in minutes:
+        c = candles_1m.get((token, m))
+        if not c:
+            return  # wait until all 5 exist
+        one_min_candles.append(c)
+
+    candles_5m[key_5m] = {
+        "start": five_min_start,
+        "open": one_min_candles[0]["open"],
+        "high": max(c["high"] for c in one_min_candles),
+        "low": min(c["low"] for c in one_min_candles),
+        "close": one_min_candles[-1]["close"],
+        "volume": sum(c["volume"] for c in one_min_candles),
+    }
+
+    log_closed_5m_candle(token, candles_5m[key_5m])
+
+
 
 # ================== WEBSOCKET ==================
 
