@@ -174,7 +174,7 @@ def start_kite_ticker(tokens):
         tick_engine_started = True
         logger.info("Tick engine started")
         ws.subscribe(tokens)
-        ws.set_mode(ws.MODE_QUOTE, tokens)
+        ws.set_mode(ws.MODE_FULL, tokens)
 
     def on_ticks(ws, ticks):
         for tick in ticks:
