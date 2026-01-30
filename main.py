@@ -1,36 +1,38 @@
 import os
 import logging
-from datetime import date
+from datetime import date, datetime, timedelta
+from collections import defaultdict
 
 from flask import Flask
 import gspread
 from google.auth import default
 from kiteconnect import KiteConnect, KiteTicker
-from datetime import datetime, timedelta
-from collections import defaultdict
+
+# ================== GLOBAL STATE ==================
 
 tick_engine_started = False
 
-# ========= TRACK A: REALTIME 1-MIN CANDLES =========
-
+# Track A: realtime 1-minute candles
 # {(instrument_token, minute_start): candle_dict}
 candles_1m = {}
 
-# Track last seen minute per instrument (for candle close detection)
+# Track last seen minute per instrument
 last_minute_seen = {}
 
-
+# ================== LOGGING ==================
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+# ================== FLASK ==================
 
+app = Flask(__name__)
 
 @app.route("/")
 def health_check():
     return "TRKD bootstrap service running", 200
 
+# ================== BOOTSTRAP ==================
 
 def bootstrap_checks():
     logger.info("=== TRKD BOOTSTRAP START ===")
@@ -61,12 +63,12 @@ def bootstrap_checks():
 
     logger.info("=== TRKD BOOTSTRAP SUCCESS ===")
 
+# ================== INSTRUMENT RESOLUTION ==================
 
 ALLOWED_FUT_NAMES = {
     "NIFTY": "NIFTY",
     "BANKNIFTY": "BANKNIFTY"
 }
-
 
 def resolve_current_month_fut(kite, index_name):
     instruments = kite.instruments("NFO")
@@ -96,69 +98,9 @@ def resolve_current_month_fut(kite, index_name):
 
     return selected["instrument_token"]
 
-
-def start_kite_ticker(tokens):
-    kws = KiteTicker(
-        api_key=os.getenv("KITE_API_KEY"),
-        access_token=os.getenv("KITE_ACCESS_TOKEN")
-    )
-
-    def on_connect(ws, response):
-        global tick_engine_started
-        tick_engine_started = True
-        logger.info("Tick engine started")
-
-        logger.info("Kite WebSocket connected")
-        ws.subscribe(tokens)
-        ws.set_mode(ws.MODE_QUOTE, tokens)
-
-    def on_ticks(ws, ticks):
-    for tick in ticks:
-        process_tick_to_1m(tick)
-
-         
-            """   logger.info(
-                f"TICK {tick['instrument_token']} "
-                f"LTP={tick.get('last_price')} "
-                f"VOL={tick.get('volume_traded', 0)} "
-                f"OI={tick.get('oi', 0)}"
-            )
-        """
-    def on_close(ws, code, reason):
-        logger.warning(f"Kite WebSocket closed: {code} {reason}")
-
-    kws.on_connect = on_connect
-    kws.on_ticks = on_ticks
-    kws.on_close = on_close
-
-    kws.connect(threaded=True)
-
-
-def kite_rest_check():
-    logger.info("=== KITE REST CHECK START ===")
-
-    api_key = os.getenv("KITE_API_KEY")
-    access_token = os.getenv("KITE_ACCESS_TOKEN")
-
-    kite = KiteConnect(api_key=api_key)
-    kite.set_access_token(access_token)
-
-    profile = kite.profile()
-    logger.info(f"Kite user: {profile.get('user_name')}")
-
-    logger.info(f"NFO instruments loaded: {len(kite.instruments('NFO'))}")
-
-    nifty_token = resolve_current_month_fut(kite, "NIFTY")
-    banknifty_token = resolve_current_month_fut(kite, "BANKNIFTY")
-
-    start_kite_ticker([nifty_token, banknifty_token])
-
-    logger.info("=== KITE REST CHECK SUCCESS ===")
+# ================== TICK → 1M CANDLES ==================
 
 def detect_minute_close(token, current_minute):
-    """
-    Detect when a minute rolls over for an instrument.
-    """
     last_minute = last_minute_seen.get(token)
 
     if last_minute is None:
@@ -166,7 +108,6 @@ def detect_minute_close(token, current_minute):
         return
 
     if current_minute > last_minute:
-        # A minute has closed
         closed_key = (token, last_minute)
         closed_candle = candles_1m.get(closed_key)
 
@@ -175,16 +116,12 @@ def detect_minute_close(token, current_minute):
 
         last_minute_seen[token] = current_minute
 
-
 def process_tick_to_1m(tick):
-    """
-    Convert ticks into 1-minute OHLCV candles (Track A).
-    """
     if "exchange_timestamp" not in tick:
-    return
+        return
 
     if tick.get("last_price") is None:
-    return
+        return
 
     token = tick["instrument_token"]
     price = tick["last_price"]
@@ -194,11 +131,9 @@ def process_tick_to_1m(tick):
     minute = ts.replace(second=0, microsecond=0)
 
     key = (token, minute)
-
     candle = candles_1m.get(key)
 
     if candle is None:
-        # New candle
         candles_1m[key] = {
             "start": minute,
             "open": price,
@@ -226,6 +161,54 @@ def log_closed_1m_candle(token, candle):
         f"V={candle['volume']}"
     )
 
+# ================== WEBSOCKET ==================
+
+def start_kite_ticker(tokens):
+    kws = KiteTicker(
+        api_key=os.getenv("KITE_API_KEY"),
+        access_token=os.getenv("KITE_ACCESS_TOKEN")
+    )
+
+    def on_connect(ws, response):
+        global tick_engine_started
+        tick_engine_started = True
+        logger.info("Tick engine started")
+        ws.subscribe(tokens)
+        ws.set_mode(ws.MODE_QUOTE, tokens)
+
+    def on_ticks(ws, ticks):
+        for tick in ticks:
+            process_tick_to_1m(tick)
+
+    def on_close(ws, code, reason):
+        logger.warning(f"Kite WebSocket closed: {code} {reason}")
+
+    kws.on_connect = on_connect
+    kws.on_ticks = on_ticks
+    kws.on_close = on_close
+
+    kws.connect(threaded=True)
+
+# ================== KITE REST ==================
+
+def kite_rest_check():
+    logger.info("=== KITE REST CHECK START ===")
+
+    kite = KiteConnect(api_key=os.getenv("KITE_API_KEY"))
+    kite.set_access_token(os.getenv("KITE_ACCESS_TOKEN"))
+
+    profile = kite.profile()
+    logger.info(f"Kite user: {profile.get('user_name')}")
+
+    nifty_token = resolve_current_month_fut(kite, "NIFTY")
+    banknifty_token = resolve_current_month_fut(kite, "BANKNIFTY")
+
+    start_kite_ticker([nifty_token, banknifty_token])
+
+    logger.info("Track A ready: waiting for live ticks")
+    logger.info("=== KITE REST CHECK SUCCESS ===")
+
+# ================== ENTRYPOINT ==================
 
 def safe_bootstrap():
     try:
@@ -235,9 +218,7 @@ def safe_bootstrap():
     except Exception:
         logger.exception("BOOTSTRAP FAILED (non-fatal)")
 
-
 safe_bootstrap()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
-logger.info("Track A ready: waiting for live ticks to build 1-minute candles")
