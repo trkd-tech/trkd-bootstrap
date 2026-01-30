@@ -28,6 +28,16 @@ vwap_state = {
 # Track last seen minute per instrument
 last_minute_seen = {}
 
+# Track A: Opening Range per instrument
+opening_range = {
+    # token: {
+    #   "high": float,
+    #   "low": float,
+    #   "finalized": bool
+    # }
+}
+
+
 # ================== LOGGING ==================
 
 logging.basicConfig(level=logging.INFO)
@@ -223,6 +233,14 @@ def aggregate_5m_from_1m(token, closed_minute):
 
     log_closed_5m_candle(token, candles_5m[key_5m])
     update_vwap(token, candles_5m[key_5m])
+    update_opening_range(token, candles_5m[key_5m])
+
+# ================== Open Range Logger ==================
+def log_opening_range(token, state):
+    logger.info(
+        f"OPENING RANGE FINALIZED | token={token} | "
+        f"HIGH={state['high']} LOW={state['low']}"
+    )
 
 
 # ================== VWAP update function ==================
@@ -262,6 +280,76 @@ def log_vwap(token, vwap, candle_start):
         f"VWAP | token={token} | "
         f"upto={candle_start} | "
         f"VWAP={round(vwap, 2)}"
+    )
+
+# ================== Opening Range update function ==================
+def update_opening_range(token, candle_5m):
+    """
+    Update opening range between 09:15 and 09:45.
+    """
+    start = candle_5m["start"].time()
+
+    # Only consider candles from 09:15 to before 09:45
+    if not (start >= datetime.strptime("09:15", "%H:%M").time()
+            and start < datetime.strptime("09:45", "%H:%M").time()):
+        return
+
+    state = opening_range.get(token)
+
+    if state is None:
+        state = {
+            "high": candle_5m["high"],
+            "low": candle_5m["low"],
+            "finalized": False
+        }
+        opening_range[token] = state
+    else:
+        if state["finalized"]:
+            return
+        state["high"] = max(state["high"], candle_5m["high"])
+        state["low"] = min(state["low"], candle_5m["low"])
+
+    # Finalize at 09:40 candle close (which completes at 09:45)
+    if start == datetime.strptime("09:40", "%H:%M").time():
+        state["finalized"] = True
+        log_opening_range(token, state)
+
+# ================== Opening Range Backfill ==================
+def backfill_opening_range(kite, token):
+    """
+    Backfill Opening Range using historical 5-minute candles.
+    Runs only if OR is not already finalized.
+    """
+    if token in opening_range and opening_range[token]["finalized"]:
+        return  # already done
+
+    today = datetime.now().date()
+
+    from_dt = datetime.combine(today, datetime.strptime("09:15", "%H:%M").time())
+    to_dt = datetime.combine(today, datetime.strptime("09:45", "%H:%M").time())
+
+    candles = kite.historical_data(
+        instrument_token=token,
+        from_date=from_dt,
+        to_date=to_dt,
+        interval="5minute"
+    )
+
+    if not candles:
+        logger.warning("No historical candles for OR backfill")
+        return
+
+    high = max(c["high"] for c in candles)
+    low = min(c["low"] for c in candles)
+
+    opening_range[token] = {
+        "high": high,
+        "low": low,
+        "finalized": True
+    }
+
+    logger.info(
+        f"OPENING RANGE BACKFILLED | token={token} | HIGH={high} LOW={low}"
     )
 
 
@@ -307,6 +395,10 @@ def kite_rest_check():
     nifty_token = resolve_current_month_fut(kite, "NIFTY")
     banknifty_token = resolve_current_month_fut(kite, "BANKNIFTY")
 
+    # Backfill OR if needed
+    backfill_opening_range(kite, nifty_token)
+    backfill_opening_range(kite, banknifty_token)
+    
     start_kite_ticker([nifty_token, banknifty_token])
 
     logger.info("Track A ready: waiting for live ticks")
