@@ -20,6 +20,11 @@ candles_1m = {}
 # {(instrument_token, five_min_start): candle_dict}
 candles_5m = {}
 
+# Track A: VWAP state per instrument
+vwap_state = {
+    # token: {"cum_pv": float, "cum_vol": int, "vwap": float}
+}
+
 # Track last seen minute per instrument
 last_minute_seen = {}
 
@@ -217,7 +222,47 @@ def aggregate_5m_from_1m(token, closed_minute):
     }
 
     log_closed_5m_candle(token, candles_5m[key_5m])
+    update_vwap(token, candles_5m[key_5m])
 
+
+# ================== VWAP update function ==================
+def update_vwap(token, candle_5m):
+    """
+    Update session VWAP using a closed 5-minute candle.
+    """
+    typical_price = (
+        candle_5m["high"] +
+        candle_5m["low"] +
+        candle_5m["close"]
+    ) / 3
+
+    pv = typical_price * candle_5m["volume"]
+
+    state = vwap_state.get(token)
+
+    if state is None:
+        state = {
+            "cum_pv": 0.0,
+            "cum_vol": 0,
+            "vwap": None
+        }
+        vwap_state[token] = state
+
+    state["cum_pv"] += pv
+    state["cum_vol"] += candle_5m["volume"]
+
+    if state["cum_vol"] > 0:
+        state["vwap"] = state["cum_pv"] / state["cum_vol"]
+
+    log_vwap(token, state["vwap"], candle_5m["start"])
+
+# ================== VWAP Logger ==================
+def log_vwap(token, vwap, candle_start):
+    logger.info(
+        f"VWAP | token={token} | "
+        f"upto={candle_start} | "
+        f"VWAP={round(vwap, 2)}"
+    )
 
 
 # ================== WEBSOCKET ==================
