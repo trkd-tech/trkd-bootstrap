@@ -420,6 +420,32 @@ def evaluate_orb_breakout(token, candle_5m):
         log_signal(token, signal, candle_5m)
         paper_enter_position(token, signal, candle_5m)
 
+# ================== Paper Trading ==================
+def paper_enter_position(token, signal, candle_5m):
+    """
+    Simulate a paper trade entry.
+    """
+    if token in positions and positions[token]["open"]:
+        return  # already in position
+
+    price = candle_5m["close"]
+    qty = 1  # temp default; we’ll map token → lot size later
+
+    positions[token] = {
+        "direction": signal,
+        "entry_price": price,
+        "entry_time": candle_5m["start"],
+        "qty": qty,
+        "open": True
+    }
+
+    logger.info(
+        f"PAPER ENTRY | token={token} | "
+        f"DIRECTION={signal} | "
+        f"PRICE={price} | "
+        f"QTY={qty}"
+    )
+    
 # ================== Signal Logger ==================
 def log_signal(token, signal, candle):
     logger.info(
@@ -447,7 +473,11 @@ def start_kite_ticker(tokens):
 
     def on_ticks(ws, ticks):
         for tick in ticks:
+            try:
             process_tick_to_1m(tick)
+            update_mtm(tick)
+        except Exception:
+            logger.exception("Tick processing error (non-fatal)")
 
     def on_close(ws, code, reason):
         logger.warning(f"Kite WebSocket closed: {code} {reason}")
