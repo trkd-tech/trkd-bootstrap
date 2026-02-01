@@ -421,10 +421,22 @@ def safe_bootstrap():
     bootstrap_checks()
     kite_rest_check()
 
-safe_bootstrap()
+# ============================================================
+# safe bootstrap to background thread
+# ============================================================
+
+def start_background_engine():
+    safe_bootstrap()
 
 if __name__ == "__main__":
+    # Start Flask FIRST (Cloud Run requirement)
+    threading.Thread(
+        target=start_background_engine,
+        daemon=True
+    ).start()
+
     app.run(host="0.0.0.0", port=8080)
+
 # ============================================================
 # Heartbeat log (temporary)
 # ============================================================
