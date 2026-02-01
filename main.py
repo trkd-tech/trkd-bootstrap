@@ -375,12 +375,10 @@ def start_kite_ticker(tokens):
     )
 
     def on_connect(ws, response):
-    logger.info("Kite WebSocket connected")
-    ws.subscribe(tokens)
-    ws.set_mode(ws.MODE_FULL, tokens)
+        logger.info("Kite WebSocket connected")
+        ws.subscribe(tokens)
+        ws.set_mode(ws.MODE_FULL, tokens)
 
-    kws.on_connect = on_connect
-    
     def on_ticks(ws, ticks):
         for tick in ticks:
             try:
@@ -398,7 +396,6 @@ def start_kite_ticker(tokens):
     kws.on_close = on_close
 
     kws.connect(threaded=True)
-
 
 
 # ============================================================
@@ -426,16 +423,27 @@ def safe_bootstrap():
 # ============================================================
 
 def start_background_engine():
-    safe_bootstrap()
+    try:
+        bootstrap_checks()
+        kite_rest_check()
+        logger.info("BACKGROUND ENGINE STARTED")
+    except Exception:
+        logger.exception("Background engine failed")
 
 if __name__ == "__main__":
-    # Start Flask FIRST (Cloud Run requirement)
+    # Start background services AFTER Flask is ready
     threading.Thread(
         target=start_background_engine,
         daemon=True
     ).start()
 
+    threading.Thread(
+        target=heartbeat,
+        daemon=True
+    ).start()
+
     app.run(host="0.0.0.0", port=8080)
+
 
 # ============================================================
 # Heartbeat log (temporary)
@@ -446,5 +454,5 @@ def heartbeat():
         logger.info("SYSTEM ALIVE | waiting for ticks")
         time.sleep(60)
 
-threading.Thread(target=heartbeat, daemon=True).start()
+# threading.Thread(target=heartbeat, daemon=True).start()
 
