@@ -1,21 +1,12 @@
 """
 TRKD — Algorithmic Trading Runtime (Monolith v1)
 
-This file intentionally contains all logic end-to-end for:
+End-to-end runtime for:
 - Market data ingestion (Kite WebSocket + REST)
 - Candle aggregation (1m, 5m)
 - Indicator computation (VWAP, Opening Range)
 - Strategy signal generation (VWAP ORB)
-- Paper execution & exits (risk engine)
-
-Once Strategy 1 is validated in live markets, this file
-will be split by responsibility into:
-
-- data/        → ticks, candles
-- indicators/  → vwap, opening range
-- strategies/  → vwap_orb
-- execution/   → paper, live
-- risk/        → exits, trailing SL
+- Paper execution & exits
 
 DO NOT prematurely refactor.
 Stability > purity.
@@ -29,7 +20,6 @@ import os
 import logging
 import threading
 import time
-
 from datetime import date, datetime, timedelta
 
 from flask import Flask
@@ -37,54 +27,36 @@ import gspread
 from google.auth import default
 from kiteconnect import KiteConnect, KiteTicker
 
-
 # ============================================================
 # GLOBAL CONFIG & STATE
 # ============================================================
 
-EXECUTION_MODE = "PAPER"        # "LIVE" later
-LIVE_TRADING_ENABLED = False   # HARD SAFETY SWITCH
+EXECUTION_MODE = "PAPER"
+LIVE_TRADING_ENABLED = False
 
 tick_engine_started = False
 
 # token -> {"index": "NIFTY" / "BANKNIFTY"}
 token_meta = {}
 
-# ------------------------------------------------------------
-# DATA ENGINE STATE (future: data/)
-# ------------------------------------------------------------
+# ============================================================
+# DATA / INDICATOR / STRATEGY STATE
+# ============================================================
 
-candles_1m = {}     # (token, minute) -> OHLCV
-candles_5m = {}     # (token, five_min) -> OHLCV
+candles_1m = {}
+candles_5m = {}
 last_minute_seen = {}
 
-# ------------------------------------------------------------
-# INDICATORS STATE (future: indicators/)
-# ------------------------------------------------------------
+vwap_state = {}
+opening_range = {}
+strategy_state = {}
 
-vwap_state = {}     # token -> {cum_pv, cum_vol, vwap}
-opening_range = {} # token -> {high, low, finalized}
-
-# ------------------------------------------------------------
-# STRATEGY STATE (future: strategies/)
-# ------------------------------------------------------------
-
-strategy_state = {} # token -> {signal, triggered, date}
-
-# ------------------------------------------------------------
-# EXECUTION STATE (future: execution/)
-# ------------------------------------------------------------
-
-positions = {}      # token -> position dict
+positions = {}
 
 PAPER_QTY = {
     "NIFTY": 50,
     "BANKNIFTY": 15
 }
-
-# ------------------------------------------------------------
-# RISK CONFIG (future: risk/)
-# ------------------------------------------------------------
 
 TRAIL_SL_POINTS = {
     "NIFTY": 40,
@@ -101,7 +73,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# FLASK (health check only)
+# FLASK (health only)
 # ============================================================
 
 app = Flask(__name__)
@@ -111,7 +83,16 @@ def health_check():
     return "TRKD runtime alive", 200
 
 # ============================================================
-# BOOTSTRAP (future: infra/)
+# HEARTBEAT (OBSERVABILITY)
+# ============================================================
+
+def heartbeat():
+    while True:
+        logger.info("SYSTEM ALIVE | waiting for ticks")
+        time.sleep(60)
+
+# ============================================================
+# BOOTSTRAP
 # ============================================================
 
 def bootstrap_checks():
@@ -133,7 +114,7 @@ def bootstrap_checks():
     logger.info("=== BOOTSTRAP SUCCESS ===")
 
 # ============================================================
-# INSTRUMENT RESOLUTION (future: data/instruments.py)
+# INSTRUMENT RESOLUTION
 # ============================================================
 
 def resolve_current_month_fut(kite, index_name):
@@ -160,7 +141,7 @@ def resolve_current_month_fut(kite, index_name):
     return selected["instrument_token"]
 
 # ============================================================
-# DATA ENGINE — TICKS → CANDLES (future: data/candles.py)
+# TICK → 1M CANDLES
 # ============================================================
 
 def process_tick_to_1m(tick):
@@ -197,7 +178,7 @@ def detect_minute_close(token, minute):
     last_minute_seen[token] = minute
 
 # ============================================================
-# 5-MIN CANDLES
+# 5M CANDLES
 # ============================================================
 
 def aggregate_5m_from_1m(token, closed_minute):
@@ -209,6 +190,7 @@ def aggregate_5m_from_1m(token, closed_minute):
 
     mins = [five_start + timedelta(minutes=i) for i in range(5)]
     parts = [candles_1m.get((token, m)) for m in mins]
+
     if any(p is None for p in parts):
         return
 
@@ -229,7 +211,7 @@ def aggregate_5m_from_1m(token, closed_minute):
     check_vwap_recross_exit(token, candle)
 
 # ============================================================
-# INDICATORS (future: indicators/)
+# INDICATORS
 # ============================================================
 
 def update_vwap(token, candle):
@@ -263,7 +245,7 @@ def update_opening_range(token, candle):
         logger.info(f"OPENING RANGE FINALIZED | {token} | H={s['high']} L={s['low']}")
 
 # ============================================================
-# STRATEGY — VWAP ORB (future: strategies/vwap_orb.py)
+# STRATEGY
 # ============================================================
 
 def evaluate_orb_breakout(token, candle):
@@ -297,7 +279,7 @@ def evaluate_orb_breakout(token, candle):
         paper_enter_position(token, signal, candle)
 
 # ============================================================
-# EXECUTION — PAPER (future: execution/)
+# EXECUTION & RISK
 # ============================================================
 
 def paper_enter_position(token, signal, candle):
@@ -310,7 +292,6 @@ def paper_enter_position(token, signal, candle):
     positions[token] = {
         "direction": signal,
         "entry_price": price,
-        "entry_time": candle["start"],
         "qty": PAPER_QTY[index],
         "open": True,
         "best_price": price
@@ -324,15 +305,11 @@ def paper_exit_position(token, price, reason):
         return
 
     pnl = (price - pos["entry_price"]) * pos["qty"] \
-          if pos["direction"] == "LONG" \
-          else (pos["entry_price"] - price) * pos["qty"]
+        if pos["direction"] == "LONG" \
+        else (pos["entry_price"] - price) * pos["qty"]
 
     pos["open"] = False
     logger.info(f"PAPER EXIT | {token} | {reason} | PNL={round(pnl,2)}")
-
-# ============================================================
-# RISK ENGINE (future: risk/)
-# ============================================================
 
 def check_trailing_sl(tick):
     token = tick["instrument_token"]
@@ -341,8 +318,7 @@ def check_trailing_sl(tick):
         return
 
     ltp = tick["last_price"]
-    index = token_meta[token]["index"]
-    trail = TRAIL_SL_POINTS[index]
+    trail = TRAIL_SL_POINTS[token_meta[token]["index"]]
 
     if pos["direction"] == "LONG":
         pos["best_price"] = max(pos["best_price"], ltp)
@@ -351,21 +327,15 @@ def check_trailing_sl(tick):
 
 def check_vwap_recross_exit(token, candle):
     pos = positions.get(token)
-    if not pos or not pos["open"]:
-        return
-
-    vwap = vwap_state[token]["vwap"]
-    close = candle["close"]
-
-    if pos["direction"] == "LONG" and close < vwap:
-        paper_exit_position(token, close, "VWAP_RECROSS")
+    if pos and pos["open"] and candle["close"] < vwap_state[token]["vwap"]:
+        paper_exit_position(token, candle["close"], "VWAP_RECROSS")
 
 def check_time_exit(tick):
     if tick["exchange_timestamp"].strftime("%H:%M") >= TIME_EXIT_HHMM:
         paper_exit_position(tick["instrument_token"], tick["last_price"], "TIME_EXIT")
 
 # ============================================================
-# WEBSOCKET (future: data/ticks.py)
+# WEBSOCKET
 # ============================================================
 
 def start_kite_ticker(tokens):
@@ -386,73 +356,39 @@ def start_kite_ticker(tokens):
                 check_trailing_sl(tick)
                 check_time_exit(tick)
             except Exception:
-                logger.exception("Tick error (non-fatal)")
-
-    def on_close(ws, code, reason):
-        logger.warning(f"Kite WebSocket closed: {code} {reason}")
+                logger.exception("Tick error")
 
     kws.on_connect = on_connect
     kws.on_ticks = on_ticks
-    kws.on_close = on_close
-
     kws.connect(threaded=True)
 
-
 # ============================================================
-# KITE REST + ENTRYPOINT
-# ============================================================
-
-def kite_rest_check():
-    kite = KiteConnect(api_key=os.getenv("KITE_API_KEY"))
-    kite.set_access_token(os.getenv("KITE_ACCESS_TOKEN"))
-
-    nifty = resolve_current_month_fut(kite, "NIFTY")
-    banknifty = resolve_current_month_fut(kite, "BANKNIFTY")
-
-    token_meta[nifty] = {"index": "NIFTY"}
-    token_meta[banknifty] = {"index": "BANKNIFTY"}
-
-    start_kite_ticker([nifty, banknifty])
-
-def safe_bootstrap():
-    bootstrap_checks()
-    kite_rest_check()
-
-# ============================================================
-# safe bootstrap to background thread
+# BACKGROUND ENGINE
 # ============================================================
 
 def start_background_engine():
     try:
         bootstrap_checks()
-        kite_rest_check()
+        kite = KiteConnect(api_key=os.getenv("KITE_API_KEY"))
+        kite.set_access_token(os.getenv("KITE_ACCESS_TOKEN"))
+
+        nifty = resolve_current_month_fut(kite, "NIFTY")
+        banknifty = resolve_current_month_fut(kite, "BANKNIFTY")
+
+        token_meta[nifty] = {"index": "NIFTY"}
+        token_meta[banknifty] = {"index": "BANKNIFTY"}
+
+        start_kite_ticker([nifty, banknifty])
+
         logger.info("BACKGROUND ENGINE STARTED")
     except Exception:
         logger.exception("Background engine failed")
 
+# ============================================================
+# ENTRYPOINT (Cloud Run safe)
+# ============================================================
+
 if __name__ == "__main__":
-    # Start background services AFTER Flask is ready
-    threading.Thread(
-        target=start_background_engine,
-        daemon=True
-    ).start()
-
-    threading.Thread(
-        target=heartbeat,
-        daemon=True
-    ).start()
-
+    threading.Thread(target=start_background_engine, daemon=True).start()
+    threading.Thread(target=heartbeat, daemon=True).start()
     app.run(host="0.0.0.0", port=8080)
-
-
-# ============================================================
-# Heartbeat log (temporary)
-# ============================================================
-
-def heartbeat():
-    while True:
-        logger.info("SYSTEM ALIVE | waiting for ticks")
-        time.sleep(60)
-
-# threading.Thread(target=heartbeat, daemon=True).start()
-
