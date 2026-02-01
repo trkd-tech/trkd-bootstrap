@@ -27,12 +27,16 @@ Stability > purity.
 
 import os
 import logging
+import threading
+import time
+
 from datetime import date, datetime, timedelta
 
 from flask import Flask
 import gspread
 from google.auth import default
 from kiteconnect import KiteConnect, KiteTicker
+
 
 # ============================================================
 # GLOBAL CONFIG & STATE
@@ -370,6 +374,13 @@ def start_kite_ticker(tokens):
         access_token=os.getenv("KITE_ACCESS_TOKEN")
     )
 
+    def on_connect(ws, response):
+    logger.info("Kite WebSocket connected")
+    ws.subscribe(tokens)
+    ws.set_mode(ws.MODE_FULL, tokens)
+
+    kws.on_connect = on_connect
+    
     def on_ticks(ws, ticks):
         for tick in ticks:
             try:
@@ -379,8 +390,16 @@ def start_kite_ticker(tokens):
             except Exception:
                 logger.exception("Tick error (non-fatal)")
 
+    def on_close(ws, code, reason):
+        logger.warning(f"Kite WebSocket closed: {code} {reason}")
+
+    kws.on_connect = on_connect
     kws.on_ticks = on_ticks
+    kws.on_close = on_close
+
     kws.connect(threaded=True)
+
+
 
 # ============================================================
 # KITE REST + ENTRYPOINT
@@ -406,3 +425,14 @@ safe_bootstrap()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+# ============================================================
+# Heartbeat log (temporary)
+# ============================================================
+
+def heartbeat():
+    while True:
+        logger.info("SYSTEM ALIVE | waiting for ticks")
+        time.sleep(60)
+
+threading.Thread(target=heartbeat, daemon=True).start()
+
