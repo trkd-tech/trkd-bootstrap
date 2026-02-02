@@ -171,11 +171,38 @@ def process_tick_to_1m(tick):
 
     detect_minute_close(token, ts)
 
-def detect_minute_close(token, minute):
-    last = last_minute_seen.get(token)
-    if last and minute > last:
-        aggregate_5m_from_1m(token, last)
-    last_minute_seen[token] = minute
+def detect_minute_close(token, current_minute):
+    """
+    Detect transition to a new minute.
+    When minute advances, the previous minute is considered CLOSED.
+    """
+    last_minute = last_minute_seen.get(token)
+
+    if last_minute is None:
+        last_minute_seen[token] = current_minute
+        return
+
+    if current_minute > last_minute:
+        # last_minute is now CLOSED
+        closed_key = (token, last_minute)
+        candle_1m = candles_1m.get(closed_key)
+
+        if candle_1m:
+            logger.info(
+                f"1M CLOSED | token={token} | "
+                f"{candle_1m['start']} | "
+                f"O={candle_1m['open']} "
+                f"H={candle_1m['high']} "
+                f"L={candle_1m['low']} "
+                f"C={candle_1m['close']} "
+                f"V={candle_1m['volume']}"
+            )
+
+            # Attempt 5-minute aggregation ONLY on minute close
+            aggregate_5m_from_1m(token, last_minute)
+
+        last_minute_seen[token] = current_minute
+
 
 # ============================================================
 # 5M CANDLES
@@ -355,13 +382,13 @@ def start_kite_ticker(tokens):
                 process_tick_to_1m(tick)
                 check_trailing_sl(tick)
                 check_time_exit(tick)
-           # TEMPORARY LOGGER
-                logger.info(
-                    f"TICK | token={tick['instrument_token']} "
-                    f"LTP={tick.get('last_price')} "
-                    f"VOL={tick.get('volume_traded')}"
-                    )
-            # TEMPORARY LOGGER ENDS
+           # ===========TEMPORARY LOGGER =================
+                # logger.info(
+                #    f"TICK | token={tick['instrument_token']} "
+                #    f"LTP={tick.get('last_price')} "
+                #    f"VOL={tick.get('volume_traded')}"
+                #    )
+            # ========== TEMPORARY LOGGER ENDS =============
             except Exception:
                 logger.exception("Tick error")
 
