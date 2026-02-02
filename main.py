@@ -107,6 +107,49 @@ def health_check():
     return "TRKD runtime alive", 200
 
 # ============================================================
+# Opening range backfill
+# ============================================================
+
+def backfill_opening_range(kite, token):
+    """
+    Backfill Opening Range using historical 5-minute candles.
+    Safe to call multiple times.
+    """
+    if token in opening_range and opening_range[token]["finalized"]:
+        return
+
+    today = datetime.now().date()
+
+    from_dt = datetime.combine(today, datetime.strptime("09:15", "%H:%M").time())
+    to_dt   = datetime.combine(today, datetime.strptime("09:45", "%H:%M").time())
+
+    candles = kite.historical_data(
+        instrument_token=token,
+        from_date=from_dt,
+        to_date=to_dt,
+        interval="5minute"
+    )
+
+    if not candles:
+        logger.warning(f"OR BACKFILL FAILED | token={token} | no candles")
+        return
+
+    high = max(c["high"] for c in candles)
+    low  = min(c["low"] for c in candles)
+
+    opening_range[token] = {
+        "high": high,
+        "low": low,
+        "finalized": True
+    }
+
+    logger.info(
+        f"OPENING RANGE BACKFILLED | token={token} | "
+        f"HIGH={high} LOW={low}"
+    )
+
+
+# ============================================================
 # BOOTSTRAP (infra + config validation)
 # ============================================================
 
@@ -460,10 +503,15 @@ def start_background_engine():
 
         nifty = resolve_current_month_fut(kite, "NIFTY")
         banknifty = resolve_current_month_fut(kite, "BANKNIFTY")
-
+        
         token_meta[nifty] = {"index": "NIFTY"}
         token_meta[banknifty] = {"index": "BANKNIFTY"}
-
+        
+        logger.info("Attempting Opening Range backfill")
+        backfill_opening_range(kite, nifty)
+        backfill_opening_range(kite, banknifty)
+        
+       
         start_kite_ticker([nifty, banknifty])
 
         logger.info("BACKGROUND ENGINE STARTED")
