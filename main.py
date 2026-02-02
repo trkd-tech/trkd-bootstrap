@@ -1,12 +1,21 @@
 """
 TRKD — Algorithmic Trading Runtime (Monolith v1)
 
-End-to-end runtime for:
+This file intentionally contains all logic end-to-end for:
 - Market data ingestion (Kite WebSocket + REST)
 - Candle aggregation (1m, 5m)
 - Indicator computation (VWAP, Opening Range)
 - Strategy signal generation (VWAP ORB)
-- Paper execution & exits
+- Paper execution & exits (risk engine)
+
+Once Strategy 1 is validated in live markets, this file
+will be split by responsibility into:
+
+- data/        → ticks, candles
+- indicators/  → vwap, opening range
+- strategies/  → vwap_orb
+- execution/   → paper, live
+- risk/        → exits, trailing SL
 
 DO NOT prematurely refactor.
 Stability > purity.
@@ -21,7 +30,6 @@ import logging
 import threading
 import time
 from datetime import date, datetime, timedelta
-import pytz
 
 from flask import Flask
 import gspread
@@ -32,34 +40,47 @@ from kiteconnect import KiteConnect, KiteTicker
 # GLOBAL CONFIG & STATE
 # ============================================================
 
-EXECUTION_MODE = "PAPER"
-LIVE_TRADING_ENABLED = False
-
-tick_engine_started = False
+EXECUTION_MODE = "PAPER"        # "LIVE" later
+LIVE_TRADING_ENABLED = False   # HARD SAFETY SWITCH
 
 # token -> {"index": "NIFTY" / "BANKNIFTY"}
 token_meta = {}
 
-IST = pytz.timezone("Asia/Kolkata")
+# ------------------------------------------------------------
+# DATA ENGINE STATE (future: data/)
+# ------------------------------------------------------------
 
-# ============================================================
-# DATA / INDICATOR / STRATEGY STATE
-# ============================================================
+candles_1m = {}       # (token, minute_start) -> candle
+candles_5m = {}       # (token, five_min_start) -> candle
+last_minute_seen = {} # token -> last minute timestamp
 
-candles_1m = {}
-candles_5m = {}
-last_minute_seen = {}
+# ------------------------------------------------------------
+# INDICATORS STATE (future: indicators/)
+# ------------------------------------------------------------
 
-vwap_state = {}
-opening_range = {}
-strategy_state = {}
+vwap_state = {}       # token -> {cum_pv, cum_vol, vwap}
+opening_range = {}   # token -> {high, low, finalized}
 
-positions = {}
+# ------------------------------------------------------------
+# STRATEGY STATE (future: strategies/)
+# ------------------------------------------------------------
+
+strategy_state = {}  # token -> {signal, triggered, date}
+
+# ------------------------------------------------------------
+# EXECUTION STATE (future: execution/)
+# ------------------------------------------------------------
+
+positions = {}       # token -> position dict
 
 PAPER_QTY = {
     "NIFTY": 50,
     "BANKNIFTY": 15
 }
+
+# ------------------------------------------------------------
+# RISK CONFIG (future: risk/)
+# ------------------------------------------------------------
 
 TRAIL_SL_POINTS = {
     "NIFTY": 40,
@@ -76,7 +97,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# FLASK (health only)
+# FLASK (health check only — Cloud Run requirement)
 # ============================================================
 
 app = Flask(__name__)
@@ -85,27 +106,8 @@ app = Flask(__name__)
 def health_check():
     return "TRKD runtime alive", 200
 
-
 # ============================================================
-# Ticket from UTC to IST
-# ============================================================
-
-def to_ist(ts):
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=pytz.utc)
-    return ts.astimezone(IST)
-
-# ============================================================
-# HEARTBEAT (OBSERVABILITY)
-# ============================================================
-
-def heartbeat():
-    while True:
-        logger.info("SYSTEM ALIVE | waiting for ticks")
-        time.sleep(60)
-
-# ============================================================
-# BOOTSTRAP
+# BOOTSTRAP (infra + config validation)
 # ============================================================
 
 def bootstrap_checks():
@@ -154,7 +156,7 @@ def resolve_current_month_fut(kite, index_name):
     return selected["instrument_token"]
 
 # ============================================================
-# TICK → 1M CANDLES
+# DATA ENGINE — TICKS → 1-MIN CANDLES
 # ============================================================
 
 def process_tick_to_1m(tick):
@@ -162,13 +164,13 @@ def process_tick_to_1m(tick):
         return
 
     token = tick["instrument_token"]
-    ts = to_ist(tick["exchange_timestamp"]).replace(second=0, microsecond=0)
+    ts = tick["exchange_timestamp"].replace(second=0, microsecond=0)
     price = tick["last_price"]
 
     key = (token, ts)
     candle = candles_1m.get(key)
 
-    if not candle:
+    if candle is None:
         candles_1m[key] = {
             "start": ts,
             "open": price,
@@ -184,59 +186,43 @@ def process_tick_to_1m(tick):
 
     detect_minute_close(token, ts)
 
-def detect_minute_close(token, current_minute):
-    """
-    Detect transition to a new minute.
-    When minute advances, the previous minute is considered CLOSED.
-    """
-    last_minute = last_minute_seen.get(token)
+def detect_minute_close(token, minute):
+    last = last_minute_seen.get(token)
+    if last and minute > last:
+        log_closed_1m(token, last)
+        aggregate_5m_from_1m(token, last)
+    last_minute_seen[token] = minute
 
-    if last_minute is None:
-        last_minute_seen[token] = current_minute
+def log_closed_1m(token, minute):
+    candle = candles_1m.get((token, minute))
+    if not candle:
         return
-
-    if current_minute > last_minute:
-        # last_minute is now CLOSED
-        closed_key = (token, last_minute)
-        candle_1m = candles_1m.get(closed_key)
-
-        if candle_1m:
-            logger.info(
-                f"1M CLOSED | token={token} | "
-                f"{candle_1m['start']} | "
-                f"O={candle_1m['open']} "
-                f"H={candle_1m['high']} "
-                f"L={candle_1m['low']} "
-                f"C={candle_1m['close']} "
-                f"V={candle_1m['volume']}"
-            )
-
-            # Attempt 5-minute aggregation ONLY on minute close
-            aggregate_5m_from_1m(token, last_minute)
-
-        last_minute_seen[token] = current_minute
-
+    logger.info(
+        f"1M CLOSED | token={token} | {minute} | "
+        f"O={candle['open']} H={candle['high']} "
+        f"L={candle['low']} C={candle['close']} V={candle['volume']}"
+    )
 
 # ============================================================
-# 5M CANDLES
+# 5-MIN CANDLES
 # ============================================================
 
 def aggregate_5m_from_1m(token, closed_minute):
-    five_start = closed_minute.replace(minute=(closed_minute.minute // 5) * 5)
-    key = (token, five_start)
+    five_start = closed_minute.replace(
+        minute=(closed_minute.minute // 5) * 5,
+        second=0,
+        microsecond=0
+    )
 
+    key = (token, five_start)
     if key in candles_5m:
         return
 
-    mins = [five_start + timedelta(minutes=i) for i in range(5)]
-    parts = [candles_1m.get((token, m)) for m in mins]
+    minutes = [five_start + timedelta(minutes=i) for i in range(5)]
+    parts = [candles_1m.get((token, m)) for m in minutes]
 
-   if any(p is None for p in parts):
-       logger.info(
-            f"5M WAIT | token={token} | bucket={five_start}"
-        )
+    if any(p is None for p in parts):
         return
-
 
     candle = {
         "start": five_start,
@@ -249,20 +235,19 @@ def aggregate_5m_from_1m(token, closed_minute):
 
     candles_5m[key] = candle
 
+    logger.info(
+        f"5M CLOSED | token={token} | {five_start} | "
+        f"O={candle['open']} H={candle['high']} "
+        f"L={candle['low']} C={candle['close']} V={candle['volume']}"
+    )
+
     update_vwap(token, candle)
     update_opening_range(token, candle)
     evaluate_orb_breakout(token, candle)
     check_vwap_recross_exit(token, candle)
-#======== Temp Logger
-    logger.info(
-        f"5M CHECK | token={token} | "
-        f"bucket={five_start} | "
-        f"minutes={[m.strftime('%H:%M') for m in mins]}"
-    )
-#======== Temp Logger Ends
 
 # ============================================================
-# INDICATORS
+# INDICATORS — VWAP & OPENING RANGE
 # ============================================================
 
 def update_vwap(token, candle):
@@ -276,6 +261,7 @@ def update_vwap(token, candle):
 
 def update_opening_range(token, candle):
     t = candle["start"].time()
+
     if not (datetime.strptime("09:15","%H:%M").time() <= t < datetime.strptime("09:45","%H:%M").time()):
         return
 
@@ -293,10 +279,10 @@ def update_opening_range(token, candle):
 
     if t == datetime.strptime("09:40","%H:%M").time():
         s["finalized"] = True
-        logger.info(f"OPENING RANGE FINALIZED | {token} | H={s['high']} L={s['low']}")
+        logger.info(f"OPENING RANGE FINALIZED | token={token} | H={s['high']} L={s['low']}")
 
 # ============================================================
-# STRATEGY
+# STRATEGY — VWAP ORB
 # ============================================================
 
 def evaluate_orb_breakout(token, candle):
@@ -330,7 +316,7 @@ def evaluate_orb_breakout(token, candle):
         paper_enter_position(token, signal, candle)
 
 # ============================================================
-# EXECUTION & RISK
+# EXECUTION — PAPER
 # ============================================================
 
 def paper_enter_position(token, signal, candle):
@@ -343,24 +329,31 @@ def paper_enter_position(token, signal, candle):
     positions[token] = {
         "direction": signal,
         "entry_price": price,
+        "entry_time": candle["start"],
         "qty": PAPER_QTY[index],
         "open": True,
         "best_price": price
     }
 
-    logger.info(f"PAPER ENTRY | {token} | {signal} @ {price}")
+    logger.info(f"PAPER ENTRY | token={token} | {signal} @ {price}")
 
 def paper_exit_position(token, price, reason):
     pos = positions.get(token)
     if not pos or not pos["open"]:
         return
 
-    pnl = (price - pos["entry_price"]) * pos["qty"] \
-        if pos["direction"] == "LONG" \
+    pnl = (
+        (price - pos["entry_price"]) * pos["qty"]
+        if pos["direction"] == "LONG"
         else (pos["entry_price"] - price) * pos["qty"]
+    )
 
     pos["open"] = False
-    logger.info(f"PAPER EXIT | {token} | {reason} | PNL={round(pnl,2)}")
+    logger.info(f"PAPER EXIT | token={token} | {reason} | PNL={round(pnl,2)}")
+
+# ============================================================
+# RISK ENGINE
+# ============================================================
 
 def check_trailing_sl(tick):
     token = tick["instrument_token"]
@@ -369,7 +362,8 @@ def check_trailing_sl(tick):
         return
 
     ltp = tick["last_price"]
-    trail = TRAIL_SL_POINTS[token_meta[token]["index"]]
+    index = token_meta[token]["index"]
+    trail = TRAIL_SL_POINTS[index]
 
     if pos["direction"] == "LONG":
         pos["best_price"] = max(pos["best_price"], ltp)
@@ -378,12 +372,31 @@ def check_trailing_sl(tick):
 
 def check_vwap_recross_exit(token, candle):
     pos = positions.get(token)
-    if pos and pos["open"] and candle["close"] < vwap_state[token]["vwap"]:
-        paper_exit_position(token, candle["close"], "VWAP_RECROSS")
+    if not pos or not pos["open"]:
+        return
+
+    vwap = vwap_state[token]["vwap"]
+    close = candle["close"]
+
+    if pos["direction"] == "LONG" and close < vwap:
+        paper_exit_position(token, close, "VWAP_RECROSS")
 
 def check_time_exit(tick):
     if tick["exchange_timestamp"].strftime("%H:%M") >= TIME_EXIT_HHMM:
-        paper_exit_position(tick["instrument_token"], tick["last_price"], "TIME_EXIT")
+        paper_exit_position(
+            tick["instrument_token"],
+            tick["last_price"],
+            "TIME_EXIT"
+        )
+
+# ============================================================
+# HEARTBEAT (debug liveness)
+# ============================================================
+
+def heartbeat():
+    while True:
+        logger.info("SYSTEM ALIVE | waiting for ticks")
+        time.sleep(60)
 
 # ============================================================
 # WEBSOCKET
@@ -406,27 +419,26 @@ def start_kite_ticker(tokens):
                 process_tick_to_1m(tick)
                 check_trailing_sl(tick)
                 check_time_exit(tick)
-           # ===========TEMPORARY LOGGER =================
-                # logger.info(
-                #    f"TICK | token={tick['instrument_token']} "
-                #    f"LTP={tick.get('last_price')} "
-                #    f"VOL={tick.get('volume_traded')}"
-                #    )
-            # ========== TEMPORARY LOGGER ENDS =============
             except Exception:
-                logger.exception("Tick error")
+                logger.exception("Tick error (non-fatal)")
+
+    def on_close(ws, code, reason):
+        logger.warning(f"Kite WebSocket closed: {code} {reason}")
 
     kws.on_connect = on_connect
     kws.on_ticks = on_ticks
+    kws.on_close = on_close
+
     kws.connect(threaded=True)
 
 # ============================================================
-# BACKGROUND ENGINE
+# BOOTSTRAP THREAD
 # ============================================================
 
 def start_background_engine():
     try:
         bootstrap_checks()
+
         kite = KiteConnect(api_key=os.getenv("KITE_API_KEY"))
         kite.set_access_token(os.getenv("KITE_ACCESS_TOKEN"))
 
