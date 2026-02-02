@@ -258,6 +258,13 @@ def update_vwap(token, candle):
     s["cum_pv"] += pv
     s["cum_vol"] += candle["volume"]
     s["vwap"] = s["cum_pv"] / s["cum_vol"]
+    #========Temp logger
+    logger.info(
+        f"VWAP | token={token} | "
+        f"upto={candle['start']} | "
+        f"VWAP={round(s['vwap'], 2)}"
+    )
+    #========Temp logger ends
 
 def update_opening_range(token, candle):
     t = candle["start"].time()
@@ -314,6 +321,15 @@ def evaluate_orb_breakout(token, candle):
             "date": today
         }
         paper_enter_position(token, signal, candle)
+
+    #=== Temp logger
+    logger.info(
+        f"ORB CHECK | token={token} | "
+        f"close={candle['close']} | "
+        f"OR=({orr['low']},{orr['high']}) | "
+        f"VWAP={round(vwap,2)}"
+    )
+    #=== Temp logger Ends
 
 # ============================================================
 # EXECUTION — PAPER
