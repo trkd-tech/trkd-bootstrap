@@ -21,6 +21,7 @@ import logging
 import threading
 import time
 from datetime import date, datetime, timedelta
+import pytz
 
 from flask import Flask
 import gspread
@@ -38,6 +39,8 @@ tick_engine_started = False
 
 # token -> {"index": "NIFTY" / "BANKNIFTY"}
 token_meta = {}
+
+IST = pytz.timezone("Asia/Kolkata")
 
 # ============================================================
 # DATA / INDICATOR / STRATEGY STATE
@@ -81,6 +84,16 @@ app = Flask(__name__)
 @app.route("/")
 def health_check():
     return "TRKD runtime alive", 200
+
+
+# ============================================================
+# Ticket from UTC to IST
+# ============================================================
+
+def to_ist(ts):
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=pytz.utc)
+    return ts.astimezone(IST)
 
 # ============================================================
 # HEARTBEAT (OBSERVABILITY)
@@ -149,7 +162,7 @@ def process_tick_to_1m(tick):
         return
 
     token = tick["instrument_token"]
-    ts = tick["exchange_timestamp"].replace(second=0, microsecond=0)
+    ts = to_ist(tick["exchange_timestamp"]).replace(second=0, microsecond=0)
     price = tick["last_price"]
 
     key = (token, ts)
@@ -218,8 +231,12 @@ def aggregate_5m_from_1m(token, closed_minute):
     mins = [five_start + timedelta(minutes=i) for i in range(5)]
     parts = [candles_1m.get((token, m)) for m in mins]
 
-    if any(p is None for p in parts):
+   if any(p is None for p in parts):
+       logger.info(
+            f"5M WAIT | token={token} | bucket={five_start}"
+        )
         return
+
 
     candle = {
         "start": five_start,
@@ -236,6 +253,13 @@ def aggregate_5m_from_1m(token, closed_minute):
     update_opening_range(token, candle)
     evaluate_orb_breakout(token, candle)
     check_vwap_recross_exit(token, candle)
+#======== Temp Logger
+    logger.info(
+        f"5M CHECK | token={token} | "
+        f"bucket={five_start} | "
+        f"minutes={[m.strftime('%H:%M') for m in mins]}"
+    )
+#======== Temp Logger Ends
 
 # ============================================================
 # INDICATORS
