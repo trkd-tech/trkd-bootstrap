@@ -355,6 +355,13 @@ def start_kite_ticker(tokens):
                 process_tick_to_1m(tick)
                 check_trailing_sl(tick)
                 check_time_exit(tick)
+           # TEMPORARY LOGGER
+                logger.info(
+                    f"TICK | token={tick['instrument_token']} "
+                    f"LTP={tick.get('last_price')} "
+                    f"VOL={tick.get('volume_traded')}"
+                    )
+            # TEMPORARY LOGGER ENDS
             except Exception:
                 logger.exception("Tick error")
 
