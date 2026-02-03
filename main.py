@@ -107,18 +107,21 @@ def health_check():
     return "TRKD runtime alive", 200
 
 # ============================================================
-# Opening range backfill
+# OPENING RANGE BACKFILL (IST SAFE)
 # ============================================================
 
 def backfill_opening_range(kite, token):
     """
     Backfill Opening Range using historical 5-minute candles.
+    Uses IST market date explicitly (Cloud Run runs in UTC).
     Safe to call multiple times.
     """
     if token in opening_range and opening_range[token]["finalized"]:
         return
 
-    today = datetime.now().date()
+    # ---- FIX: force IST date ----
+    ist_now = datetime.now() + timedelta(hours=5, minutes=30)
+    today = ist_now.date()
 
     from_dt = datetime.combine(today, datetime.strptime("09:15", "%H:%M").time())
     to_dt   = datetime.combine(today, datetime.strptime("09:45", "%H:%M").time())
@@ -131,7 +134,10 @@ def backfill_opening_range(kite, token):
     )
 
     if not candles:
-        logger.warning(f"OR BACKFILL FAILED | token={token} | no candles")
+        logger.warning(
+            f"OR BACKFILL FAILED | token={token} | "
+            f"from={from_dt} to={to_dt}"
+        )
         return
 
     high = max(c["high"] for c in candles)
@@ -145,9 +151,8 @@ def backfill_opening_range(kite, token):
 
     logger.info(
         f"OPENING RANGE BACKFILLED | token={token} | "
-        f"HIGH={high} LOW={low}"
+        f"HIGH={high} LOW={low} | candles={len(candles)}"
     )
-
 
 # ============================================================
 # BOOTSTRAP (infra + config validation)
@@ -301,13 +306,12 @@ def update_vwap(token, candle):
     s["cum_pv"] += pv
     s["cum_vol"] += candle["volume"]
     s["vwap"] = s["cum_pv"] / s["cum_vol"]
-    #========Temp logger
+
     logger.info(
         f"VWAP | token={token} | "
         f"upto={candle['start']} | "
         f"VWAP={round(s['vwap'], 2)}"
     )
-    #========Temp logger ends
 
 def update_opening_range(token, candle):
     t = candle["start"].time()
@@ -329,7 +333,10 @@ def update_opening_range(token, candle):
 
     if t == datetime.strptime("09:40","%H:%M").time():
         s["finalized"] = True
-        logger.info(f"OPENING RANGE FINALIZED | token={token} | H={s['high']} L={s['low']}")
+        logger.info(
+            f"OPENING RANGE FINALIZED | token={token} | "
+            f"H={s['high']} L={s['low']}"
+        )
 
 # ============================================================
 # STRATEGY — VWAP ORB
@@ -339,11 +346,18 @@ def evaluate_orb_breakout(token, candle):
     today = candle["start"].date()
     state = strategy_state.get(token)
 
+    orr = opening_range.get(token)
+    vw  = vwap_state.get(token)
+
+    # --- Always visible for debugging ---
+    logger.info(
+        f"ORB CHECK | token={token} | "
+        f"time={candle['start']} | "
+        f"OR={orr} | VWAP={vw['vwap'] if vw else None}"
+    )
+
     if state and state["triggered"] and state["date"] == today:
         return
-
-    orr = opening_range.get(token)
-    vw = vwap_state.get(token)
 
     if not orr or not orr["finalized"] or not vw:
         return
@@ -364,15 +378,6 @@ def evaluate_orb_breakout(token, candle):
             "date": today
         }
         paper_enter_position(token, signal, candle)
-
-    #=== Temp logger
-    logger.info(
-        f"ORB CHECK | token={token} | "
-        f"close={candle['close']} | "
-        f"OR=({orr['low']},{orr['high']}) | "
-        f"VWAP={round(vwap,2)}"
-    )
-    #=== Temp logger Ends
 
 # ============================================================
 # EXECUTION — PAPER
@@ -441,12 +446,13 @@ def check_vwap_recross_exit(token, candle):
         paper_exit_position(token, close, "VWAP_RECROSS")
 
 def check_time_exit(tick):
+    token = tick["instrument_token"]
+    pos = positions.get(token)
+    if not pos or not pos["open"]:
+        return
+
     if tick["exchange_timestamp"].strftime("%H:%M") >= TIME_EXIT_HHMM:
-        paper_exit_position(
-            tick["instrument_token"],
-            tick["last_price"],
-            "TIME_EXIT"
-        )
+        paper_exit_position(token, tick["last_price"], "TIME_EXIT")
 
 # ============================================================
 # HEARTBEAT (debug liveness)
@@ -503,15 +509,14 @@ def start_background_engine():
 
         nifty = resolve_current_month_fut(kite, "NIFTY")
         banknifty = resolve_current_month_fut(kite, "BANKNIFTY")
-        
+
         token_meta[nifty] = {"index": "NIFTY"}
         token_meta[banknifty] = {"index": "BANKNIFTY"}
-        
+
         logger.info("Attempting Opening Range backfill")
         backfill_opening_range(kite, nifty)
         backfill_opening_range(kite, banknifty)
-        
-       
+
         start_kite_ticker([nifty, banknifty])
 
         logger.info("BACKGROUND ENGINE STARTED")
