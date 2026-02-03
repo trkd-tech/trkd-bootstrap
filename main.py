@@ -106,6 +106,85 @@ app = Flask(__name__)
 def health_check():
     return "TRKD runtime alive", 200
 
+
+# ============================================================
+# VWAP BACKFILL (Track B)
+# ============================================================
+
+def backfill_vwap(kite, token):
+    """
+    Backfill VWAP state from market open (09:15 IST) till
+    last completed 5-minute candle.
+    Safe to call multiple times.
+    """
+
+    # Guard: do not backfill twice
+    state = vwap_state.get(token)
+    if state and state.get("seeded"):
+        return
+
+    today = datetime.now().date()
+
+    from_dt = datetime.combine(
+        today,
+        datetime.strptime("09:15", "%H:%M").time()
+    )
+
+    # Use current time rounded DOWN to last completed 5m candle
+    now = datetime.now()
+    last_complete_5m = now.replace(
+        minute=(now.minute // 5) * 5,
+        second=0,
+        microsecond=0
+    )
+
+    if last_complete_5m <= from_dt:
+        logger.warning(f"VWAP BACKFILL SKIPPED | token={token} | too early")
+        return
+
+    logger.info(f"VWAP BACKFILL START | token={token}")
+
+    candles = kite.historical_data(
+        instrument_token=token,
+        from_date=from_dt,
+        to_date=last_complete_5m,
+        interval="5minute"
+    )
+
+    if not candles:
+        logger.warning(f"VWAP BACKFILL FAILED | token={token} | no candles")
+        return
+
+    cum_pv = 0.0
+    cum_vol = 0
+
+    for c in candles:
+        tp = (c["high"] + c["low"] + c["close"]) / 3
+        pv = tp * c["volume"]
+        cum_pv += pv
+        cum_vol += c["volume"]
+
+    if cum_vol == 0:
+        logger.warning(f"VWAP BACKFILL FAILED | token={token} | zero volume")
+        return
+
+    vwap = cum_pv / cum_vol
+
+    vwap_state[token] = {
+        "cum_pv": cum_pv,
+        "cum_vol": cum_vol,
+        "vwap": vwap,
+        "seeded": True
+    }
+
+    logger.info(
+        f"VWAP BACKFILL DONE | token={token} | "
+        f"cum_vol={cum_vol} | VWAP={round(vwap,2)} | candles={len(candles)}"
+    )
+
+
+
+
 # ============================================================
 # OPENING RANGE BACKFILL (IST SAFE)
 # ============================================================
@@ -513,10 +592,14 @@ def start_background_engine():
         token_meta[nifty] = {"index": "NIFTY"}
         token_meta[banknifty] = {"index": "BANKNIFTY"}
 
+        logger.info("Attempting VWAP backfill")
+        backfill_vwap(kite, nifty)
+        backfill_vwap(kite, banknifty)
+        
         logger.info("Attempting Opening Range backfill")
         backfill_opening_range(kite, nifty)
         backfill_opening_range(kite, banknifty)
-
+        
         start_kite_ticker([nifty, banknifty])
 
         logger.info("BACKGROUND ENGINE STARTED")
