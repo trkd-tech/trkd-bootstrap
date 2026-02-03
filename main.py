@@ -19,7 +19,7 @@ import os
 import logging
 import threading
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from flask import Flask
 import gspread
@@ -36,6 +36,8 @@ LIVE_TRADING_ENABLED = False
 TIME_EXIT_HHMM = "15:20"
 OR_START = datetime.strptime("09:15", "%H:%M").time()
 OR_END   = datetime.strptime("09:45", "%H:%M").time()
+
+IST_OFFSET = timedelta(hours=5, minutes=30)
 
 # ============================================================
 # GLOBAL STATE
@@ -109,6 +111,16 @@ def bootstrap_checks():
     logger.info("=== BOOTSTRAP SUCCESS ===")
 
 # ============================================================
+# IST
+# ============================================================
+
+
+def now_ist():
+    return datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(
+        timezone(IST_OFFSET)
+    )
+
+# ============================================================
 # INSTRUMENT RESOLUTION
 # ============================================================
 
@@ -158,19 +170,32 @@ def backfill_opening_range(kite, token):
         f"H={opening_range[token]['high']} L={opening_range[token]['low']} | candles={len(candles)}"
     )
 
+# ============================================================
+# VWAP Backfill
+# ============================================================
+
 def backfill_vwap(kite, token):
-    now = datetime.now()
+    now = now_ist()
+
     if now.time() < OR_START:
-        logger.warning(f"VWAP BACKFILL SKIPPED | token={token} | too early")
+        logger.warning(
+            f"VWAP BACKFILL SKIPPED | token={token} | "
+            f"now_ist={now.time()} < OR_START"
+        )
         return
 
     today = now.date()
+
     candles = kite.historical_data(
-        token,
-        datetime.combine(today, OR_START),
-        now,
-        "5minute"
+        instrument_token=token,
+        from_date=datetime.combine(today, OR_START),
+        to_date=now,
+        interval="5minute"
     )
+
+    if not candles:
+        logger.warning(f"VWAP BACKFILL FAILED | token={token} | no candles")
+        return
 
     cum_pv = 0
     cum_vol = 0
@@ -181,6 +206,7 @@ def backfill_vwap(kite, token):
         cum_vol += c["volume"]
 
     if cum_vol == 0:
+        logger.warning(f"VWAP BACKFILL FAILED | token={token} | zero volume")
         return
 
     vwap_state[token] = {
@@ -190,7 +216,9 @@ def backfill_vwap(kite, token):
     }
 
     logger.info(
-        f"VWAP BACKFILL DONE | token={token} | VWAP={round(vwap_state[token]['vwap'],2)}"
+        f"VWAP BACKFILL DONE | token={token} | "
+        f"VWAP={round(vwap_state[token]['vwap'], 2)} | "
+        f"candles={len(candles)}"
     )
 
 # ============================================================
