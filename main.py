@@ -275,6 +275,13 @@ def update_vwap(token, candle):
     s["cum_vol"] += candle["volume"]
     s["vwap"] = s["cum_pv"] / s["cum_vol"]
 
+    logger.info(
+        f"VWAP UPDATE | token={token} | "
+        f"time={candle['start']} | "
+        f"VWAP={round(s['vwap'], 2)}"
+    )
+
+
 # ============================================================
 # STRATEGIES
 # ============================================================
