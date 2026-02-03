@@ -33,6 +33,9 @@ OR_START = datetime.strptime("09:15", "%H:%M").time()
 OR_END   = datetime.strptime("09:45", "%H:%M").time()
 TIME_EXIT_HHMM = "15:20"
 
+# Cumulative volume tracker (required for VWAP correctness)
+last_cum_volume = {}   # token -> last seen cumulative volume
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -208,12 +211,26 @@ def backfill_vwap(kite, token):
 # ============================================================
 
 def process_tick_to_1m(t):
-    if "exchange_timestamp" not in t:
+    if "exchange_timestamp" not in t or "last_price" not in t:
         return
 
     token = t["instrument_token"]
     ts = t["exchange_timestamp"].replace(second=0, microsecond=0)
     price = t["last_price"]
+
+    # --- FIX: convert cumulative volume → delta volume ---
+    cum_vol = t.get("volume_traded")
+    if cum_vol is None:
+        return
+
+    prev_cum = last_cum_volume.get(token)
+    if prev_cum is None:
+        delta_vol = 0
+    else:
+        delta_vol = max(cum_vol - prev_cum, 0)
+
+    last_cum_volume[token] = cum_vol
+    # -----------------------------------------------------
 
     c = candles_1m.setdefault((token, ts), {
         "start": ts,
@@ -227,9 +244,10 @@ def process_tick_to_1m(t):
     c["high"] = max(c["high"], price)
     c["low"] = min(c["low"], price)
     c["close"] = price
-    c["volume"] = t.get("volume_traded", c["volume"])
+    c["volume"] += delta_vol   # ✅ CORRECT volume accumulation
 
     detect_minute_close(token, ts)
+
 
 def detect_minute_close(token, minute):
     last = last_minute_seen.get(token)
