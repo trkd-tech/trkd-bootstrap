@@ -29,7 +29,7 @@ import os
 import logging
 import threading
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from flask import Flask
 import gspread
@@ -45,6 +45,8 @@ LIVE_TRADING_ENABLED = False   # HARD SAFETY SWITCH
 
 # token -> {"index": "NIFTY" / "BANKNIFTY"}
 token_meta = {}
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # ------------------------------------------------------------
 # DATA ENGINE STATE (future: data/)
@@ -123,23 +125,28 @@ def backfill_vwap(kite, token):
     if state and state.get("seeded"):
         return
 
-    today = datetime.now().date()
+    now_ist = datetime.now(IST)
+    today = now_ist.date()
 
     from_dt = datetime.combine(
         today,
-        datetime.strptime("09:15", "%H:%M").time()
+        datetime.strptime("09:15", "%H:%M").time(),
+        tzinfo=IST
     )
 
     # Use current time rounded DOWN to last completed 5m candle
-    now = datetime.now()
-    last_complete_5m = now.replace(
-        minute=(now.minute // 5) * 5,
+    last_complete_5m = now_ist.replace(
+        minute=(now_ist.minute // 5) * 5,
         second=0,
         microsecond=0
     )
 
+
     if last_complete_5m <= from_dt:
-        logger.warning(f"VWAP BACKFILL SKIPPED | token={token} | too early")
+        logger.warning(
+            f"VWAP BACKFILL SKIPPED | token={token} | "
+            f"now_ist={now_ist.time()}"
+        )
         return
 
     logger.info(f"VWAP BACKFILL START | token={token}")
