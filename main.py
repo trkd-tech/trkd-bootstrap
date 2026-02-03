@@ -1,15 +1,14 @@
 """
-TRKD — Algorithmic Trading Runtime (Monolith v1.1)
+TRKD — Algorithmic Trading Runtime (Monolith v1)
 
-Strategies implemented:
-1. VWAP Opening Range Breakout (ORB)
-2. VWAP Crossover (5-min)
+DO NOT prematurely refactor.
+Stability > purity.
 
-Execution:
-- Paper trading only (LIVE switch guarded)
-
-Architecture:
-- Single-file by design (stability > purity)
+This file supports:
+- Track A: Live ticks → 1m → 5m
+- Track B: Historical backfill (VWAP + OR)
+- Multiple strategies (ORB + VWAP Crossover)
+- Paper execution with exits
 """
 
 # ============================================================
@@ -28,74 +27,49 @@ from google.auth import default
 from kiteconnect import KiteConnect, KiteTicker
 
 # ============================================================
-# GLOBAL CONFIG & STATE
+# GLOBAL CONFIG
 # ============================================================
 
-EXECUTION_MODE = "PAPER"        # "LIVE" later
-LIVE_TRADING_ENABLED = False   # HARD SAFETY SWITCH
-
-# token -> {"index": "NIFTY" / "BANKNIFTY"}
-token_meta = {}
-
-# ------------------------------------------------------------
-# DATA ENGINE STATE
-# ------------------------------------------------------------
-
-candles_1m = {}        # (token, minute_start) -> candle
-candles_5m = {}        # (token, five_min_start) -> candle
-last_minute_seen = {}  # token -> last minute timestamp
-
-# ------------------------------------------------------------
-# INDICATORS STATE
-# ------------------------------------------------------------
-
-vwap_state = {}        # token -> {cum_pv, cum_vol, vwap}
-opening_range = {}    # token -> {high, low, finalized}
-
-# ------------------------------------------------------------
-# STRATEGY STATE (per strategy, per token)
-# ------------------------------------------------------------
-
-STRATEGY_ORB = "VWAP_ORB"
-STRATEGY_VWAP_CROSS = "VWAP_CROSS"
-
-strategy_state = {
-    STRATEGY_ORB: {},         # token -> {triggered, date}
-    STRATEGY_VWAP_CROSS: {}   # token -> {long_count, short_count, date}
-}
-
-# ------------------------------------------------------------
-# EXECUTION STATE
-# ------------------------------------------------------------
-
-positions = {}  # token -> position dict
-
-PAPER_QTY = {
-    "NIFTY": 50,
-    "BANKNIFTY": 15
-}
-
-# ------------------------------------------------------------
-# RISK CONFIG
-# ------------------------------------------------------------
-
-TRAIL_SL_POINTS = {
-    "NIFTY": 40,
-    "BANKNIFTY": 120
-}
+EXECUTION_MODE = "PAPER"
+LIVE_TRADING_ENABLED = False
 
 TIME_EXIT_HHMM = "15:20"
+OR_START = datetime.strptime("09:15", "%H:%M").time()
+OR_END   = datetime.strptime("09:45", "%H:%M").time()
 
-# ------------------------------------------------------------
-# VWAP CROSSOVER CONFIG (Strategy #2)
-# ------------------------------------------------------------
+# ============================================================
+# GLOBAL STATE
+# ============================================================
 
-VWAP_CROSS_CONFIG = {
-    "direction": "BOTH",            # LONG / SHORT / BOTH
-    "max_trades_per_side": 1,       # per day
-    "trade_after": "09:45",         # cannot be before 09:45
-    "trade_before": "14:45",        # entries stop after this
-    "timeframe": "5m"
+token_meta = {}
+
+candles_1m = {}
+candles_5m = {}
+last_minute_seen = {}
+
+vwap_state = {}
+opening_range = {}
+
+positions = {}
+
+strategy_state = {}   # token -> strategy_name -> state
+
+# ============================================================
+# STRATEGY CONFIG
+# ============================================================
+
+STRATEGIES = {
+    "VWAP_ORB": {
+        "enabled": True,
+        "max_trades_per_day": 1
+    },
+    "VWAP_CROSSOVER": {
+        "enabled": True,
+        "direction": "BOTH",   # UP / DOWN / BOTH
+        "max_trades_per_day": 1,
+        "trade_after": "09:45",
+        "trade_before": "14:30"
+    }
 }
 
 # ============================================================
@@ -106,31 +80,28 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# FLASK (Cloud Run requirement)
+# FLASK (Cloud Run health)
 # ============================================================
 
 app = Flask(__name__)
 
 @app.route("/")
-def health_check():
-    return "TRKD runtime alive", 200
+def health():
+    return "TRKD alive", 200
 
 # ============================================================
-# BOOTSTRAP
+# BOOTSTRAP CHECKS
 # ============================================================
 
 def bootstrap_checks():
     logger.info("=== BOOTSTRAP START ===")
-
-    sheet_id = os.getenv("GOOGLE_SHEET_ID", "NOT_SET")
-    logger.info(f"GOOGLE_SHEET_ID set: {sheet_id != 'NOT_SET'}")
 
     for key in ["KITE_API_KEY", "KITE_API_SECRET", "KITE_ACCESS_TOKEN"]:
         logger.info(f"Secret {key} present: {os.getenv(key) is not None}")
 
     creds, _ = default()
     gc = gspread.authorize(creds)
-    sh = gc.open_by_key(sheet_id)
+    sh = gc.open_by_key(os.getenv("GOOGLE_SHEET_ID"))
 
     logger.info(f"SYSTEM_CONTROL rows: {len(sh.worksheet('SYSTEM_CONTROL').get_all_records())}")
     logger.info(f"STRATEGIES rows: {len(sh.worksheet('STRATEGIES').get_all_records())}")
@@ -143,86 +114,131 @@ def bootstrap_checks():
 
 def resolve_current_month_fut(kite, index_name):
     instruments = kite.instruments("NFO")
-
-    candidates = [
-        ins for ins in instruments
-        if ins["segment"] == "NFO-FUT"
-        and ins["instrument_type"] == "FUT"
-        and ins["name"] == index_name
-        and ins["expiry"] >= date.today()
+    cands = [
+        i for i in instruments
+        if i["segment"] == "NFO-FUT"
+        and i["instrument_type"] == "FUT"
+        and i["name"] == index_name
+        and i["expiry"] >= date.today()
     ]
-
-    candidates.sort(key=lambda x: x["expiry"])
-    selected = candidates[0]
+    cands.sort(key=lambda x: x["expiry"])
+    sel = cands[0]
 
     logger.info(
-        f"SELECTED FUT → {index_name} | "
-        f"{selected['tradingsymbol']} | "
-        f"Expiry={selected['expiry']} | "
-        f"Token={selected['instrument_token']}"
+        f"SELECTED FUT → {index_name} | {sel['tradingsymbol']} | "
+        f"Expiry={sel['expiry']} | Token={sel['instrument_token']}"
     )
-
-    return selected["instrument_token"]
+    return sel["instrument_token"]
 
 # ============================================================
-# DATA ENGINE — TICKS → 1M
+# TRACK B — BACKFILL
+# ============================================================
+
+def backfill_opening_range(kite, token):
+    if token in opening_range and opening_range[token]["finalized"]:
+        return
+
+    today = datetime.now().date()
+    from_dt = datetime.combine(today, OR_START)
+    to_dt   = datetime.combine(today, OR_END)
+
+    candles = kite.historical_data(token, from_dt, to_dt, "5minute")
+    if not candles:
+        logger.warning(f"OR BACKFILL FAILED | token={token}")
+        return
+
+    opening_range[token] = {
+        "high": max(c["high"] for c in candles),
+        "low":  min(c["low"] for c in candles),
+        "finalized": True
+    }
+
+    logger.info(
+        f"OPENING RANGE BACKFILLED | token={token} | "
+        f"H={opening_range[token]['high']} L={opening_range[token]['low']} | candles={len(candles)}"
+    )
+
+def backfill_vwap(kite, token):
+    now = datetime.now()
+    if now.time() < OR_START:
+        logger.warning(f"VWAP BACKFILL SKIPPED | token={token} | too early")
+        return
+
+    today = now.date()
+    candles = kite.historical_data(
+        token,
+        datetime.combine(today, OR_START),
+        now,
+        "5minute"
+    )
+
+    cum_pv = 0
+    cum_vol = 0
+
+    for c in candles:
+        tp = (c["high"] + c["low"] + c["close"]) / 3
+        cum_pv += tp * c["volume"]
+        cum_vol += c["volume"]
+
+    if cum_vol == 0:
+        return
+
+    vwap_state[token] = {
+        "cum_pv": cum_pv,
+        "cum_vol": cum_vol,
+        "vwap": cum_pv / cum_vol
+    }
+
+    logger.info(
+        f"VWAP BACKFILL DONE | token={token} | VWAP={round(vwap_state[token]['vwap'],2)}"
+    )
+
+# ============================================================
+# TRACK A — TICKS → CANDLES
 # ============================================================
 
 def process_tick_to_1m(tick):
-    if "exchange_timestamp" not in tick or tick.get("last_price") is None:
+    if "exchange_timestamp" not in tick:
         return
 
     token = tick["instrument_token"]
     ts = tick["exchange_timestamp"].replace(second=0, microsecond=0)
     price = tick["last_price"]
 
-    key = (token, ts)
-    candle = candles_1m.get(key)
+    c = candles_1m.setdefault((token, ts), {
+        "start": ts,
+        "open": price,
+        "high": price,
+        "low": price,
+        "close": price,
+        "volume": 0
+    })
 
-    if candle is None:
-        candles_1m[key] = {
-            "start": ts,
-            "open": price,
-            "high": price,
-            "low": price,
-            "close": price,
-            "volume": tick.get("volume_traded", 0)
-        }
-    else:
-        candle["high"] = max(candle["high"], price)
-        candle["low"] = min(candle["low"], price)
-        candle["close"] = price
+    c["high"] = max(c["high"], price)
+    c["low"] = min(c["low"], price)
+    c["close"] = price
+    c["volume"] = tick.get("volume_traded", c["volume"])
 
     detect_minute_close(token, ts)
 
 def detect_minute_close(token, minute):
     last = last_minute_seen.get(token)
     if last and minute > last:
-        aggregate_5m_from_1m(token, last)
+        aggregate_5m(token, last)
     last_minute_seen[token] = minute
 
-# ============================================================
-# 5-MIN CANDLES
-# ============================================================
-
-def aggregate_5m_from_1m(token, closed_minute):
-    five_start = closed_minute.replace(
-        minute=(closed_minute.minute // 5) * 5,
-        second=0,
-        microsecond=0
-    )
-
-    key = (token, five_start)
+def aggregate_5m(token, closed_min):
+    five = closed_min.replace(minute=(closed_min.minute // 5) * 5)
+    key = (token, five)
     if key in candles_5m:
         return
 
-    minutes = [five_start + timedelta(minutes=i) for i in range(5)]
-    parts = [candles_1m.get((token, m)) for m in minutes]
+    parts = [candles_1m.get((token, five + timedelta(minutes=i))) for i in range(5)]
     if any(p is None for p in parts):
         return
 
     candle = {
-        "start": five_start,
+        "start": five,
         "open": parts[0]["open"],
         "high": max(p["high"] for p in parts),
         "low": min(p["low"] for p in parts),
@@ -231,19 +247,10 @@ def aggregate_5m_from_1m(token, closed_minute):
     }
 
     candles_5m[key] = candle
-
-    logger.info(
-        f"5M CLOSED | token={token} | {five_start} | "
-        f"O={candle['open']} H={candle['high']} "
-        f"L={candle['low']} C={candle['close']}"
-    )
+    logger.info(f"5M CLOSED | token={token} | {five}")
 
     update_vwap(token, candle)
-    update_opening_range(token, candle)
-
-    evaluate_orb_breakout(token, candle)
-    evaluate_vwap_crossover(token, candle)
-
+    evaluate_strategies(token, candle)
     check_vwap_recross_exit(token, candle)
 
 # ============================================================
@@ -259,159 +266,58 @@ def update_vwap(token, candle):
     s["cum_vol"] += candle["volume"]
     s["vwap"] = s["cum_pv"] / s["cum_vol"]
 
-    logger.info(
-        f"VWAP | token={token} | "
-        f"upto={candle['start']} | VWAP={round(s['vwap'],2)}"
-    )
-
-def update_opening_range(token, candle):
-    t = candle["start"].time()
-    if not (datetime.strptime("09:15","%H:%M").time()
-            <= t < datetime.strptime("09:45","%H:%M").time()):
-        return
-
-    s = opening_range.setdefault(token, {
-        "high": candle["high"],
-        "low": candle["low"],
-        "finalized": False
-    })
-
-    if s["finalized"]:
-        return
-
-    s["high"] = max(s["high"], candle["high"])
-    s["low"] = min(s["low"], candle["low"])
-
-    if t == datetime.strptime("09:40","%H:%M").time():
-        s["finalized"] = True
-        logger.info(
-            f"OPENING RANGE FINALIZED | token={token} | "
-            f"H={s['high']} L={s['low']}"
-        )
-
 # ============================================================
-# STRATEGY 1 — VWAP ORB
+# STRATEGY ENGINE
 # ============================================================
 
-def evaluate_orb_breakout(token, candle):
-    today = candle["start"].date()
-    state = strategy_state[STRATEGY_ORB].get(token)
+def evaluate_strategies(token, candle):
+    if STRATEGIES["VWAP_ORB"]["enabled"]:
+        evaluate_orb(token, candle)
 
-    if state and state["triggered"] and state["date"] == today:
-        return
+    if STRATEGIES["VWAP_CROSSOVER"]["enabled"]:
+        evaluate_vwap_crossover(token, candle)
 
-    orr = opening_range.get(token)
-    vw = vwap_state.get(token)
-
-    if not orr or not orr["finalized"] or not vw:
+def evaluate_orb(token, candle):
+    if token not in opening_range or not opening_range[token]["finalized"]:
         return
 
     close = candle["close"]
-    vwap = vw["vwap"]
+    orr = opening_range[token]
+    vwap = vwap_state[token]["vwap"]
 
-    signal = None
     if close > orr["high"] and close > vwap:
-        signal = "LONG"
+        paper_enter_position(token, "LONG", candle, "VWAP_ORB")
     elif close < orr["low"] and close < vwap:
-        signal = "SHORT"
-
-    logger.info(
-        f"ORB CHECK | token={token} | "
-        f"close={close} OR=({orr['low']},{orr['high']}) VWAP={round(vwap,2)}"
-    )
-
-    if signal:
-        strategy_state[STRATEGY_ORB][token] = {
-            "triggered": True,
-            "date": today
-        }
-        paper_enter_position(token, signal, candle, STRATEGY_ORB)
-
-# ============================================================
-# STRATEGY 2 — VWAP CROSSOVER
-# ============================================================
+        paper_enter_position(token, "SHORT", candle, "VWAP_ORB")
 
 def evaluate_vwap_crossover(token, candle):
-    cfg = VWAP_CROSS_CONFIG
-    today = candle["start"].date()
-
-    state = strategy_state[STRATEGY_VWAP_CROSS].setdefault(token, {
-        "long_count": 0,
-        "short_count": 0,
-        "date": today
-    })
-
-    if state["date"] != today:
-        state.update({"long_count": 0, "short_count": 0, "date": today})
-
-    t = candle["start"].time()
-    if t < datetime.strptime("09:45","%H:%M").time():
-        return
-    if t < datetime.strptime(cfg["trade_after"],"%H:%M").time():
-        return
-    if t > datetime.strptime(cfg["trade_before"],"%H:%M").time():
+    prev = candles_5m.get((token, candle["start"] - timedelta(minutes=5)))
+    if not prev:
         return
 
-    prev_key = (token, candle["start"] - timedelta(minutes=5))
-    prev = candles_5m.get(prev_key)
-    vw = vwap_state.get(token)
-
-    if not prev or not vw:
-        return
-
-    prev_close = prev["close"]
-    close = candle["close"]
-    vwap = vw["vwap"]
-
-    logger.info(
-        f"VWAP_CROSS CHECK | token={token} | "
-        f"prev={prev_close} curr={close} VWAP={round(vwap,2)}"
-    )
-
-    # LONG crossover
-    if (
-        cfg["direction"] in ("LONG","BOTH")
-        and prev_close < vwap
-        and close > vwap
-        and state["long_count"] < cfg["max_trades_per_side"]
-    ):
-        state["long_count"] += 1
-        paper_enter_position(token, "LONG", candle, STRATEGY_VWAP_CROSS)
-
-    # SHORT crossover
-    if (
-        cfg["direction"] in ("SHORT","BOTH")
-        and prev_close > vwap
-        and close < vwap
-        and state["short_count"] < cfg["max_trades_per_side"]
-    ):
-        state["short_count"] += 1
-        paper_enter_position(token, "SHORT", candle, STRATEGY_VWAP_CROSS)
+    vwap = vwap_state[token]["vwap"]
+    if prev["close"] < vwap and candle["close"] > vwap:
+        paper_enter_position(token, "LONG", candle, "VWAP_CROSSOVER")
+    elif prev["close"] > vwap and candle["close"] < vwap:
+        paper_enter_position(token, "SHORT", candle, "VWAP_CROSSOVER")
 
 # ============================================================
 # EXECUTION — PAPER
 # ============================================================
 
-def paper_enter_position(token, signal, candle, strategy):
+def paper_enter_position(token, direction, candle, strategy):
     if token in positions and positions[token]["open"]:
         return
 
-    index = token_meta[token]["index"]
-    price = candle["close"]
-
     positions[token] = {
-        "direction": signal,
-        "entry_price": price,
-        "entry_time": candle["start"],
-        "qty": PAPER_QTY[index],
+        "direction": direction,
+        "entry_price": candle["close"],
         "open": True,
-        "best_price": price,
         "strategy": strategy
     }
 
     logger.info(
-        f"PAPER ENTRY | STRATEGY={strategy} | "
-        f"token={token} | {signal} @ {price}"
+        f"PAPER ENTRY | {strategy} | token={token} | {direction} @ {candle['close']}"
     )
 
 def paper_exit_position(token, price, reason):
@@ -419,36 +325,10 @@ def paper_exit_position(token, price, reason):
     if not pos or not pos["open"]:
         return
 
-    pnl = (
-        (price - pos["entry_price"]) * pos["qty"]
-        if pos["direction"] == "LONG"
-        else (pos["entry_price"] - price) * pos["qty"]
-    )
-
     pos["open"] = False
     logger.info(
-        f"PAPER EXIT | STRATEGY={pos['strategy']} | "
-        f"token={token} | {reason} | PNL={round(pnl,2)}"
+        f"PAPER EXIT | {pos['strategy']} | token={token} | {reason}"
     )
-
-# ============================================================
-# RISK ENGINE
-# ============================================================
-
-def check_trailing_sl(tick):
-    token = tick["instrument_token"]
-    pos = positions.get(token)
-    if not pos or not pos["open"]:
-        return
-
-    ltp = tick["last_price"]
-    index = token_meta[token]["index"]
-    trail = TRAIL_SL_POINTS[index]
-
-    if pos["direction"] == "LONG":
-        pos["best_price"] = max(pos["best_price"], ltp)
-        if pos["best_price"] - ltp >= trail:
-            paper_exit_position(token, ltp, "TRAIL_SL")
 
 def check_vwap_recross_exit(token, candle):
     pos = positions.get(token)
@@ -456,18 +336,10 @@ def check_vwap_recross_exit(token, candle):
         return
 
     vwap = vwap_state[token]["vwap"]
-    close = candle["close"]
-
-    if pos["direction"] == "LONG" and close < vwap:
-        paper_exit_position(token, close, "VWAP_RECROSS")
-
-def check_time_exit(tick):
-    if tick["exchange_timestamp"].strftime("%H:%M") >= TIME_EXIT_HHMM:
-        paper_exit_position(
-            tick["instrument_token"],
-            tick["last_price"],
-            "TIME_EXIT"
-        )
+    if pos["direction"] == "LONG" and candle["close"] < vwap:
+        paper_exit_position(token, candle["close"], "VWAP_RECROSS")
+    elif pos["direction"] == "SHORT" and candle["close"] > vwap:
+        paper_exit_position(token, candle["close"], "VWAP_RECROSS")
 
 # ============================================================
 # HEARTBEAT
@@ -494,44 +366,39 @@ def start_kite_ticker(tokens):
         ws.set_mode(ws.MODE_FULL, tokens)
 
     def on_ticks(ws, ticks):
-        for tick in ticks:
-            try:
-                process_tick_to_1m(tick)
-                check_trailing_sl(tick)
-                check_time_exit(tick)
-            except Exception:
-                logger.exception("Tick error (non-fatal)")
+        for t in ticks:
+            process_tick_to_1m(t)
 
     kws.on_connect = on_connect
     kws.on_ticks = on_ticks
-    kws.on_close = lambda ws, code, reason: logger.warning(
-        f"Kite WebSocket closed: {code} {reason}"
-    )
-
     kws.connect(threaded=True)
 
 # ============================================================
-# BACKGROUND ENGINE
+# BOOTSTRAP THREAD
 # ============================================================
 
 def start_background_engine():
-    try:
-        bootstrap_checks()
+    bootstrap_checks()
 
-        kite = KiteConnect(api_key=os.getenv("KITE_API_KEY"))
-        kite.set_access_token(os.getenv("KITE_ACCESS_TOKEN"))
+    kite = KiteConnect(api_key=os.getenv("KITE_API_KEY"))
+    kite.set_access_token(os.getenv("KITE_ACCESS_TOKEN"))
 
-        nifty = resolve_current_month_fut(kite, "NIFTY")
-        banknifty = resolve_current_month_fut(kite, "BANKNIFTY")
+    nifty = resolve_current_month_fut(kite, "NIFTY")
+    banknifty = resolve_current_month_fut(kite, "BANKNIFTY")
 
-        token_meta[nifty] = {"index": "NIFTY"}
-        token_meta[banknifty] = {"index": "BANKNIFTY"}
+    token_meta[nifty] = {"index": "NIFTY"}
+    token_meta[banknifty] = {"index": "BANKNIFTY"}
 
-        start_kite_ticker([nifty, banknifty])
-        logger.info("BACKGROUND ENGINE STARTED")
+    logger.info("Attempting VWAP backfill")
+    backfill_vwap(kite, nifty)
+    backfill_vwap(kite, banknifty)
 
-    except Exception:
-        logger.exception("Background engine failed")
+    logger.info("Attempting Opening Range backfill")
+    backfill_opening_range(kite, nifty)
+    backfill_opening_range(kite, banknifty)
+
+    start_kite_ticker([nifty, banknifty])
+    logger.info("BACKGROUND ENGINE STARTED")
 
 # ============================================================
 # ENTRYPOINT
