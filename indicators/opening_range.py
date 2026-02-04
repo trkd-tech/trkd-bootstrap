@@ -1,62 +1,72 @@
 """
-opening_range.py
+indicators/opening_range.py
 
-Indicator: Opening Range (OR)
+Opening Range (OR) indicator.
 
 Responsibilities:
-- Build opening range using 5-minute candles
-- Finalize OR after the OR window
-- Provide safe read-only access to OR state
+- Maintain Opening Range high / low
+- Handle OR window timing (09:15–09:45 IST)
+- Finalize OR exactly once per session
 
-This module:
-- Does NOT fetch historical data
-- Does NOT evaluate strategies
-- Does NOT place trades
+This module MUST:
+- Not place trades
+- Not evaluate strategies
+- Not fetch historical data
 """
 
-from datetime import datetime
+import logging
+from datetime import datetime, timedelta, timezone
+
+logger = logging.getLogger(__name__)
 
 # ============================================================
-# CONFIG
+# IST CONFIG
 # ============================================================
+
+IST_OFFSET = timedelta(hours=5, minutes=30)
+IST = timezone(IST_OFFSET)
 
 OR_START = datetime.strptime("09:15", "%H:%M").time()
 OR_END   = datetime.strptime("09:45", "%H:%M").time()
 
 # ============================================================
-# OR UPDATE LOGIC
+# OPENING RANGE STATE SHAPE
+# ============================================================
+# opening_range[token] = {
+#     "high": float,
+#     "low": float,
+#     "finalized": bool
+# }
+
+# ============================================================
+# CORE UPDATE
 # ============================================================
 
-def update_opening_range(opening_range, token, candle):
+def update_opening_range_from_candle(token, candle, opening_range):
     """
-    Update Opening Range using a closed candle.
+    Update Opening Range using a completed candle.
 
-    Expected candle timeframe: 5-minute
-    Expected candle structure:
+    Candle must include:
     {
-        "start": datetime,
-        "open": float,
+        "start": datetime (IST),
         "high": float,
-        "low": float,
-        "close": float,
-        "volume": int
+        "low": float
     }
+
+    Mutates opening_range[token]
     """
 
     candle_time = candle["start"].time()
 
     # Ignore candles outside OR window
-    if not (OR_START <= candle_time < OR_END):
+    if candle_time < OR_START or candle_time >= OR_END:
         return
 
-    state = opening_range.setdefault(
-        token,
-        {
-            "high": candle["high"],
-            "low": candle["low"],
-            "finalized": False
-        }
-    )
+    state = opening_range.setdefault(token, {
+        "high": candle["high"],
+        "low": candle["low"],
+        "finalized": False
+    })
 
     if state["finalized"]:
         return
@@ -64,26 +74,47 @@ def update_opening_range(opening_range, token, candle):
     state["high"] = max(state["high"], candle["high"])
     state["low"] = min(state["low"], candle["low"])
 
-    # Finalize OR on 09:40 candle close (completes at 09:45)
-    if candle_time == datetime.strptime("09:40", "%H:%M").time():
+    # Finalize at the last OR candle close (09:40–09:45 bucket)
+    if candle_time >= datetime.strptime("09:40", "%H:%M").time():
         state["finalized"] = True
-
+        logger.info(
+            f"OPENING RANGE FINALIZED | token={token} | "
+            f"H={state['high']} L={state['low']}"
+        )
 
 # ============================================================
-# READ-ONLY ACCESSORS
+# READ HELPERS
 # ============================================================
 
-def is_or_finalized(opening_range, token):
-    state = opening_range.get(token)
-    return bool(state and state.get("finalized"))
+def is_or_finalized(token, opening_range):
+    """
+    Returns True if Opening Range is finalized for token.
+    """
+    return (
+        token in opening_range and
+        opening_range[token].get("finalized") is True
+    )
 
 
-def get_opening_range(opening_range, token):
+def get_opening_range(token, opening_range):
     """
-    Returns:
-        (low, high) | None
+    Safe getter for Opening Range.
+    Returns None if not ready.
     """
-    state = opening_range.get(token)
-    if not state or not state.get("finalized"):
+    if not is_or_finalized(token, opening_range):
         return None
-    return state["low"], state["high"]
+    return opening_range[token]
+
+
+# ============================================================
+# RESET (SESSION BOUNDARY)
+# ============================================================
+
+def reset_opening_range(token, opening_range):
+    """
+    Reset Opening Range state for a token.
+    Intended for session boundary handling (future).
+    """
+    if token in opening_range:
+        del opening_range[token]
+        logger.info(f"OPENING RANGE RESET | token={token}")
