@@ -168,42 +168,55 @@ def backfill_opening_range(kite, token):
     )
 
 def backfill_vwap(kite, token):
-    now = datetime.now()
-    if now.time() < OR_START:
-        logger.warning(f"VWAP BACKFILL SKIPPED | token={token} | too early")
+    """
+    Backfill VWAP from 09:15 IST until 'now', using 5-min candles.
+    Uses ONLY naive IST datetimes (required by Kite).
+    """
+
+    today = datetime.now().date()  # naive, IST assumption
+
+    from_dt = datetime.combine(today, OR_START)
+    to_dt   = datetime.now()        # naive, IST assumption
+
+    if to_dt <= from_dt:
+        logger.warning(
+            f"VWAP BACKFILL SKIPPED | token={token} | market not started"
+        )
         return
 
-    today = now.date()
     candles = kite.historical_data(
-        token,
-        datetime.combine(today, OR_START),
-        now,
-        "5minute"
+        instrument_token=token,
+        from_date=from_dt,
+        to_date=to_dt,
+        interval="5minute"
     )
 
     if not candles:
-        logger.warning(f"VWAP BACKFILL FAILED | token={token}")
+        logger.warning(f"VWAP BACKFILL FAILED | token={token} | no candles")
         return
 
-    cum_pv, cum_vol = 0, 0
+    cum_pv = 0.0
+    cum_vol = 0
+
     for c in candles:
         tp = (c["high"] + c["low"] + c["close"]) / 3
         cum_pv += tp * c["volume"]
         cum_vol += c["volume"]
 
     if cum_vol == 0:
+        logger.warning(f"VWAP BACKFILL FAILED | token={token} | zero volume")
         return
 
     vwap_state[token] = {
         "cum_pv": cum_pv,
         "cum_vol": cum_vol,
-        "vwap": cum_pv / cum_vol,
-        "backfilled": True
+        "vwap": cum_pv / cum_vol
     }
 
     logger.info(
         f"VWAP BACKFILL DONE | token={token} | "
-        f"VWAP={round(vwap_state[token]['vwap'],2)} | candles={len(candles)}"
+        f"VWAP={round(vwap_state[token]['vwap'], 2)} | "
+        f"candles={len(candles)}"
     )
 
 # ============================================================
