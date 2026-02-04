@@ -167,20 +167,34 @@ def backfill_opening_range(kite, token):
         f"L={opening_range[token]['low']} | candles={len(candles)}"
     )
 
+
+# ============================================================
+# TRACK B — BACKFILL - Time fix
+# ============================================================
+def now_ist_naive():
+    """
+    Returns current IST time as a *naive* datetime.
+    Safe for Kite historical_data and time comparisons.
+    """
+    return datetime.utcnow() + timedelta(hours=5, minutes=30)
+
+
 def backfill_vwap(kite, token):
     """
-    Backfill VWAP from 09:15 IST until 'now', using 5-min candles.
-    Uses ONLY naive IST datetimes (required by Kite).
+    Backfill VWAP from 09:15 IST until now (IST).
+    Uses naive IST datetimes (Cloud Run safe).
     """
 
-    today = datetime.now().date()  # naive, IST assumption
+    now = now_ist_naive()
+    today = now.date()
 
     from_dt = datetime.combine(today, OR_START)
-    to_dt   = datetime.now()        # naive, IST assumption
+    to_dt   = now
 
     if to_dt <= from_dt:
         logger.warning(
-            f"VWAP BACKFILL SKIPPED | token={token} | market not started"
+            f"VWAP BACKFILL SKIPPED | token={token} | "
+            f"now_ist={to_dt.time()} < OR_START"
         )
         return
 
@@ -218,6 +232,7 @@ def backfill_vwap(kite, token):
         f"VWAP={round(vwap_state[token]['vwap'], 2)} | "
         f"candles={len(candles)}"
     )
+
 
 # ============================================================
 # TRACK A — TICKS → CANDLES
