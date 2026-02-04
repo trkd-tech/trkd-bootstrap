@@ -1,211 +1,149 @@
 """
-runtime.py
+engine/runtime.py
 
-TRKD Runtime Orchestrator.
+Main runtime loop.
 
 Responsibilities:
-- Bootstrap system
-- Resolve instruments
-- Run Track B (backfill)
-- Start WebSocket (Track A)
-- Route completed candles to:
-    - Indicators
-    - Strategies
-    - Execution
-    - Risk exits
+- Orchestrate Track A (live candles)
+- Orchestrate Track B (backfill)
+- Route candles to strategies
+- Forward signals downstream (execution later)
 
-This file is the ONLY place where modules are connected.
+This file MUST:
+- Not contain strategy logic
+- Not contain indicator math
 """
 
-# ============================================================
-# IMPORTS
-# ============================================================
-
-import os
-import threading
-import time
 import logging
-from datetime import datetime
+from datetime import timedelta
 
-from flask import Flask
-from kiteconnect import KiteConnect, KiteTicker
-
-# --- Internal modules ---
-from data.candles import process_tick_to_1m, get_last_5m_candle
-from data.backfill import backfill_vwap, backfill_opening_range
-from strategies.strategy_router import route_strategies
-from execution.paper import enter_position, exit_position
-from risk.exits import evaluate_exits
-
-# ============================================================
-# GLOBAL STATE
-# ============================================================
+from engine.strategy_router import route_strategies
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
-
-token_meta = {}        # token -> {"index": "NIFTY"/"BANKNIFTY"}
-positions = {}         # paper positions
-vwap_state = {}        # token -> vwap state
-opening_range = {}     # token -> OR state
-strategy_state = {}    # token -> per-strategy counters
 
 # ============================================================
-# FLASK (Cloud Run health check)
+# RUNTIME STATE (shared)
 # ============================================================
 
-app = Flask(__name__)
-
-@app.route("/")
-def health():
-    return "TRKD runtime alive", 200
+candles_1m = {}
+candles_5m = {}
+last_minute_seen = {}
 
 # ============================================================
-# INSTRUMENT RESOLUTION
+# TICK → 1M
 # ============================================================
 
-def resolve_current_month_fut(kite, index_name):
-    instruments = kite.instruments("NFO")
+def process_tick_to_1m(
+    tick,
+    *,
+    candles_1m,
+    last_minute_seen,
+    on_5m_close
+):
+    """
+    Convert ticks into 1-minute candles.
+    Calls `on_5m_close` when a 5m candle completes.
+    """
+    if "exchange_timestamp" not in tick:
+        return
 
-    candidates = [
-        i for i in instruments
-        if i["segment"] == "NFO-FUT"
-        and i["instrument_type"] == "FUT"
-        and i["name"] == index_name
-    ]
+    token = tick["instrument_token"]
+    ts = tick["exchange_timestamp"].replace(second=0, microsecond=0)
+    price = tick["last_price"]
 
-    candidates.sort(key=lambda x: x["expiry"])
-    selected = candidates[0]
+    candle = candles_1m.setdefault((token, ts), {
+        "start": ts,
+        "open": price,
+        "high": price,
+        "low": price,
+        "close": price,
+        "volume": 0
+    })
 
-    logger.info(
-        f"SELECTED FUT → {index_name} | "
-        f"{selected['tradingsymbol']} | "
-        f"Expiry={selected['expiry']} | "
-        f"Token={selected['instrument_token']}"
+    candle["high"] = max(candle["high"], price)
+    candle["low"] = min(candle["low"], price)
+    candle["close"] = price
+    candle["volume"] = tick.get("volume_traded", candle["volume"])
+
+    last = last_minute_seen.get(token)
+    if last and ts > last:
+        _on_1m_close(token, last, candles_1m, on_5m_close)
+
+    last_minute_seen[token] = ts
+
+
+def _on_1m_close(token, minute, candles_1m, on_5m_close):
+    five_start = minute.replace(
+        minute=(minute.minute // 5) * 5
     )
 
-    return selected["instrument_token"]
+    key = (token, five_start)
+    if key in candles_5m:
+        return
+
+    parts = [
+        candles_1m.get((token, five_start + timedelta(minutes=i)))
+        for i in range(5)
+    ]
+
+    if any(p is None for p in parts):
+        return
+
+    candle_5m = {
+        "start": five_start,
+        "open": parts[0]["open"],
+        "high": max(p["high"] for p in parts),
+        "low": min(p["low"] for p in parts),
+        "close": parts[-1]["close"],
+        "volume": sum(p["volume"] for p in parts)
+    }
+
+    candles_5m[key] = candle_5m
+
+    logger.info(
+        f"5M CLOSED | token={token} | time={five_start}"
+    )
+
+    on_5m_close(token, candle_5m)
 
 # ============================================================
-# CANDLE CLOSE HANDLER (5-MIN)
+# STRATEGY DISPATCH (NEW)
 # ============================================================
 
-def on_5m_candle_close(token, candle):
+def on_5m_candle_close(
+    *,
+    token,
+    candle,
+    candles_5m,
+    vwap_state,
+    opening_range,
+    strategy_state,
+    strategy_config
+):
     """
-    Single choke point for every completed 5-minute candle.
+    Entry point for completed 5-minute candles.
     """
 
-    # --------------------------------------------------------
-    # 1. Strategy evaluation
-    # --------------------------------------------------------
+    prev_candle = candles_5m.get(
+        (token, candle["start"] - timedelta(minutes=5))
+    )
+
     signals = route_strategies(
         token=token,
         candle=candle,
+        prev_candle=prev_candle,
         vwap_state=vwap_state,
         opening_range=opening_range,
-        strategy_state=strategy_state
+        strategy_state=strategy_state,
+        strategy_config=strategy_config
     )
 
-    # --------------------------------------------------------
-    # 2. Paper execution (entries)
-    # --------------------------------------------------------
     for signal in signals:
-        qty = 1  # placeholder (configurable later)
-        enter_position(positions, token, signal, qty)
+        logger.info(
+            f"SIGNAL EMITTED | {signal['strategy']} | "
+            f"token={signal['token']} | "
+            f"{signal['direction']} @ {signal['price']}"
+        )
 
-    # --------------------------------------------------------
-    # 3. Risk exits (VWAP recross, trail SL, time exit)
-    # --------------------------------------------------------
-    evaluate_exits(
-        token=token,
-        candle=candle,
-        vwap_state=vwap_state,
-        positions=positions,
-        token_meta=token_meta,
-        exit_position=exit_position
-    )
-
-# ============================================================
-# WEBSOCKET
-# ============================================================
-
-def start_kite_ticker(tokens):
-    kws = KiteTicker(
-        api_key=os.getenv("KITE_API_KEY"),
-        access_token=os.getenv("KITE_ACCESS_TOKEN")
-    )
-
-    def on_connect(ws, response):
-        logger.info("Kite WebSocket connected")
-        ws.subscribe(tokens)
-        ws.set_mode(ws.MODE_FULL, tokens)
-
-    def on_ticks(ws, ticks):
-        for tick in ticks:
-            process_tick_to_1m(
-                tick=tick,
-                on_5m_close=on_5m_candle_close,
-                vwap_state=vwap_state
-            )
-
-    def on_close(ws, code, reason):
-        logger.warning(f"Kite WS closed | code={code} | reason={reason}")
-
-    kws.on_connect = on_connect
-    kws.on_ticks = on_ticks
-    kws.on_close = on_close
-
-    kws.connect(threaded=True)
-
-# ============================================================
-# BOOTSTRAP
-# ============================================================
-
-def start_background_engine():
-    logger.info("=== BOOTSTRAP START ===")
-
-    kite = KiteConnect(api_key=os.getenv("KITE_API_KEY"))
-    kite.set_access_token(os.getenv("KITE_ACCESS_TOKEN"))
-
-    nifty = resolve_current_month_fut(kite, "NIFTY")
-    banknifty = resolve_current_month_fut(kite, "BANKNIFTY")
-
-    token_meta[nifty] = {"index": "NIFTY"}
-    token_meta[banknifty] = {"index": "BANKNIFTY"}
-
-    # --------------------------------------------------------
-    # Track B — Historical backfill
-    # --------------------------------------------------------
-    logger.info("Attempting VWAP backfill")
-    backfill_vwap(kite, nifty, vwap_state)
-    backfill_vwap(kite, banknifty, vwap_state)
-
-    logger.info("Attempting Opening Range backfill")
-    backfill_opening_range(kite, nifty, opening_range)
-    backfill_opening_range(kite, banknifty, opening_range)
-
-    # --------------------------------------------------------
-    # Track A — Live ticks
-    # --------------------------------------------------------
-    start_kite_ticker([nifty, banknifty])
-
-    logger.info("BACKGROUND ENGINE STARTED")
-
-# ============================================================
-# HEARTBEAT
-# ============================================================
-
-def heartbeat():
-    while True:
-        logger.info("SYSTEM ALIVE | waiting for ticks")
-        time.sleep(60)
-
-# ============================================================
-# ENTRYPOINT
-# ============================================================
-
-if __name__ == "__main__":
-    threading.Thread(target=start_background_engine, daemon=True).start()
-    threading.Thread(target=heartbeat, daemon=True).start()
-
-    app.run(host="0.0.0.0", port=8080)
+    # IMPORTANT:
+    # Execution will be plugged in here in the next step
