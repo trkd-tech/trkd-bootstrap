@@ -81,7 +81,8 @@ def evaluate_orb(
         strat_state["date"] = today
         strat_state["trades"] = 0
 
-    if strat_state["trades"] >= config["max_trades_per_day"]:
+    max_trades = config.get("max_trades_per_day", 1)
+    if strat_state["trades"] >= max_trades:
         return None
 
     close = candle["close"]
