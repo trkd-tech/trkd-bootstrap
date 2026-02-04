@@ -1,103 +1,83 @@
-# indicators/vwap.py
 """
-VWAP Indicator Engine
+vwap.py
+
+Indicator: VWAP (Volume Weighted Average Price)
 
 Responsibilities:
-- VWAP backfill from historical candles (Track B)
-- Incremental VWAP updates from live candles (Track A)
-- Maintain exact cumulative PV / volume state
+- Maintain session VWAP state
+- Extend VWAP using closed candles (Track A)
+- Start from backfilled state if present (Track B)
 
-VWAP is session-based and timeframe-independent
-when built from cumulative PV & volume.
+This module:
+- Does NOT fetch historical data
+- Does NOT evaluate strategies
+- Does NOT place trades
 """
 
-import logging
-from datetime import datetime, time as dtime
+# ============================================================
+# VWAP UPDATE LOGIC
+# ============================================================
 
-logger = logging.getLogger(__name__)
-
-
-OR_START = dtime(9, 15)   # VWAP session start
-
-
-def init_vwap_state(vwap_state, token):
+def update_vwap_from_candle(vwap_state, token, candle):
     """
-    Ensure VWAP state exists for token.
-    """
-    vwap_state.setdefault(token, {
-        "cum_pv": 0.0,
-        "cum_vol": 0,
-        "vwap": None
-    })
+    Update VWAP using a closed candle.
 
+    Args:
+        vwap_state (dict): global vwap_state
+        token (int): instrument token
+        candle (dict): closed candle with high, low, close, volume
 
-def backfill_vwap_from_candles(
-    token,
-    candles,
-    vwap_state
-):
-    """
-    Backfill VWAP using historical candles.
-
-    candles: list of candle dicts (OHLCV)
-    """
-
-    if not candles:
-        logger.warning(f"VWAP BACKFILL FAILED | token={token} | no candles")
-        return
-
-    cum_pv = 0.0
-    cum_vol = 0
-
-    for c in candles:
-        tp = (c["high"] + c["low"] + c["close"]) / 3
-        cum_pv += tp * c["volume"]
-        cum_vol += c["volume"]
-
-    if cum_vol == 0:
-        logger.warning(f"VWAP BACKFILL FAILED | token={token} | zero volume")
-        return
-
-    vwap_state[token] = {
-        "cum_pv": cum_pv,
-        "cum_vol": cum_vol,
-        "vwap": cum_pv / cum_vol
+    Expected candle structure:
+    {
+        "start": datetime,
+        "open": float,
+        "high": float,
+        "low": float,
+        "close": float,
+        "volume": int
     }
-
-    logger.info(
-        f"VWAP BACKFILL DONE | token={token} | "
-        f"VWAP={round(vwap_state[token]['vwap'], 2)} | "
-        f"candles={len(candles)}"
-    )
-
-
-def update_vwap_from_candle(
-    token,
-    candle,
-    vwap_state
-):
-    """
-    Incrementally update VWAP using a closed candle.
     """
 
-    init_vwap_state(vwap_state, token)
+    # Typical price for the candle
+    typical_price = (
+        candle["high"] +
+        candle["low"] +
+        candle["close"]
+    ) / 3
 
-    # Ignore candles before session start
-    if candle["start"].time() < OR_START:
-        return
+    pv = typical_price * candle["volume"]
 
-    tp = (candle["high"] + candle["low"] + candle["close"]) / 3
-    pv = tp * candle["volume"]
-
-    s = vwap_state[token]
-    s["cum_pv"] += pv
-    s["cum_vol"] += candle["volume"]
-
-    if s["cum_vol"] > 0:
-        s["vwap"] = s["cum_pv"] / s["cum_vol"]
-
-    logger.info(
-        f"VWAP UPDATE | token={token} | "
-        f"upto={candle['start']} | "
-        f"VWAP={round(s['vwap'], 2)}"
+    state = vwap_state.setdefault(
+        token,
+        {
+            "cum_pv": 0.0,
+            "cum_vol": 0,
+            "vwap": None
+        }
     )
+
+    state["cum_pv"] += pv
+    state["cum_vol"] += candle["volume"]
+
+    # Guard against zero volume
+    if state["cum_vol"] > 0:
+        state["vwap"] = state["cum_pv"] / state["cum_vol"]
+
+    return state["vwap"]
+
+
+# ============================================================
+# READ-ONLY ACCESSOR
+# ============================================================
+
+def get_vwap(vwap_state, token):
+    """
+    Safe accessor for current VWAP.
+
+    Returns:
+        float | None
+    """
+    state = vwap_state.get(token)
+    if not state:
+        return None
+    return state.get("vwap")
