@@ -1,42 +1,113 @@
-# data/candles.py
 """
-Candle aggregation layer
+candles.py
+
+Track A: Live ticks → 1-minute → 5-minute candles
 
 Responsibilities:
-- Aggregate 1-minute candles → 5-minute candles
-- Ensure exactly-once 5m close
-- Emit closed 5m candles via callback
+- Build 1-minute candles from ticks
+- Detect minute close
+- Aggregate 5-minute candles
+- Enforce time integrity (IST only)
 
-This module must remain indicator- and strategy-agnostic.
+This module MUST remain:
+- Stateless with respect to strategies
+- Free of execution logic
+- Free of indicator math
+
+Downstream consumers:
+- indicators/
+- strategies/
 """
 
 from datetime import timedelta
-import logging
 
-logger = logging.getLogger(__name__)
+# ============================================================
+# STATE (owned by data layer)
+# ============================================================
 
+# (token, minute_start) -> 1m candle
+candles_1m = {}
 
-def aggregate_5m_from_1m(
-    token,
-    closed_minute,
-    candles_1m,
-    candles_5m,
-    on_5m_close
-):
+# (token, five_min_start) -> 5m candle
+candles_5m = {}
+
+# token -> last seen minute (datetime)
+last_minute_seen = {}
+
+# ============================================================
+# 1-MIN CANDLE BUILDER
+# ============================================================
+
+def process_tick_to_1m(tick):
     """
-    Builds a 5-minute candle once all 5 underlying 1-minute candles exist.
-
-    on_5m_close(token, candle_5m) is called exactly once per 5-minute window.
+    Build / update 1-minute candles from live ticks.
     """
+    if "exchange_timestamp" not in tick:
+        return
 
+    price = tick.get("last_price")
+    if price is None:
+        return
+
+    token = tick["instrument_token"]
+
+    # IMPORTANT:
+    # Kite exchange_timestamp is already IST.
+    minute = tick["exchange_timestamp"].replace(second=0, microsecond=0)
+
+    key = (token, minute)
+
+    candle = candles_1m.get(key)
+    if candle is None:
+        candle = {
+            "start": minute,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
+            "volume": tick.get("volume_traded", 0),
+        }
+        candles_1m[key] = candle
+    else:
+        candle["high"] = max(candle["high"], price)
+        candle["low"] = min(candle["low"], price)
+        candle["close"] = price
+        candle["volume"] = tick.get("volume_traded", candle["volume"])
+
+    detect_minute_close(token, minute)
+
+
+# ============================================================
+# MINUTE CLOSE DETECTION
+# ============================================================
+
+def detect_minute_close(token, current_minute):
+    """
+    Detect when a 1-minute candle closes and trigger 5-minute aggregation.
+    """
+    last = last_minute_seen.get(token)
+
+    if last and current_minute > last:
+        aggregate_5m(token, last)
+
+    last_minute_seen[token] = current_minute
+
+
+# ============================================================
+# 5-MIN CANDLE AGGREGATION
+# ============================================================
+
+def aggregate_5m(token, closed_minute):
+    """
+    Aggregate five completed 1-minute candles into one 5-minute candle.
+    """
     five_start = closed_minute.replace(
         minute=(closed_minute.minute // 5) * 5,
         second=0,
-        microsecond=0
+        microsecond=0,
     )
 
     key = (token, five_start)
-
     if key in candles_5m:
         return
 
@@ -45,13 +116,9 @@ def aggregate_5m_from_1m(
         for i in range(5)
     ]
 
-    parts = [
-        candles_1m.get((token, m))
-        for m in minutes
-    ]
-
+    parts = [candles_1m.get((token, m)) for m in minutes]
     if any(p is None for p in parts):
-        return  # wait for all 5 candles
+        return  # wait until all 5 exist
 
     candle = {
         "start": five_start,
@@ -62,12 +129,13 @@ def aggregate_5m_from_1m(
         "volume": sum(p["volume"] for p in parts),
     }
 
-    candles_5m[key] = candle
-
-    logger.info(
-        f"5M CLOSED | token={token} | {five_start} | "
-        f"O={candle['open']} H={candle['high']} "
-        f"L={candle['low']} C={candle['close']} V={candle['volume']}"
+    # ========================================================
+    # HARD SAFETY: Ensure IST candles only
+    # ========================================================
+    assert candle["start"].hour >= 9, (
+        f"Non-IST candle detected: {candle['start']}"
     )
 
-    on_5m_close(token, candle)
+    candles_5m[key] = candle
+
+    return candle
