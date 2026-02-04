@@ -1,109 +1,189 @@
 """
 risk/exits.py
 
-Risk & exit engine.
+Centralized exit & risk management engine.
 
 Responsibilities:
-- Trailing stop-loss
-- Time-based exit (hard square-off)
-- Strategy-neutral exits
+- Monitor open positions
+- Trigger exits based on:
+    - VWAP recross
+    - Trailing Stop Loss
+    - Time-based exit (hard stop)
 
 This module MUST:
-- Never enter positions
+- Never enter trades
 - Never compute indicators
-- Never generate signals
+- Never talk to Kite APIs
+- Only decide WHEN to exit
 """
 
-from datetime import time
 import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# CONFIG (safe defaults)
+# EXIT CONFIG DEFAULTS
 # ============================================================
 
-TIME_EXIT = time(15, 20)   # 3:20 PM IST hard exit
-
-# trailing_sl_points[index] = points
-TRAILING_SL_POINTS = {
+DEFAULT_TRAIL_POINTS = {
     "NIFTY": 40,
     "BANKNIFTY": 120
 }
 
+HARD_EXIT_TIME = datetime.strptime("15:20", "%H:%M").time()
+
 # ============================================================
-# TRAILING STOP LOSS
+# CORE EXIT CHECK
 # ============================================================
 
-def check_trailing_sl(
-    positions,
+def evaluate_exits(
+    *,
     token,
-    ltp,
-    index_name
+    candle,
+    vwap_state,
+    positions,
+    token_meta,
+    exit_position
 ):
     """
-    Apply trailing SL to an open position.
+    Evaluate ALL exit conditions for a token on a closed candle.
 
-    Assumes:
-    - best_price is tracked inside position
+    This function is idempotent and safe to call repeatedly.
     """
 
     pos = positions.get(token)
-    if not pos or not pos["open"]:
-        return None
+    if not pos or not pos.get("open"):
+        return
 
-    trail = TRAILING_SL_POINTS.get(index_name)
-    if not trail:
-        return None
+    # --------------------------------------------------------
+    # 1. VWAP RECROSS EXIT
+    # --------------------------------------------------------
+    _check_vwap_recross(
+        token=token,
+        candle=candle,
+        vwap_state=vwap_state,
+        positions=positions,
+        exit_position=exit_position
+    )
 
-    # Initialise best price
-    pos.setdefault("best_price", pos["entry_price"])
+    # --------------------------------------------------------
+    # 2. TRAILING STOP LOSS
+    # --------------------------------------------------------
+    _check_trailing_sl(
+        token=token,
+        candle=candle,
+        positions=positions,
+        token_meta=token_meta,
+        exit_position=exit_position
+    )
+
+    # --------------------------------------------------------
+    # 3. TIME EXIT
+    # --------------------------------------------------------
+    _check_time_exit(
+        token=token,
+        candle=candle,
+        positions=positions,
+        exit_position=exit_position
+    )
+
+# ============================================================
+# EXIT RULES
+# ============================================================
+
+def _check_vwap_recross(
+    *,
+    token,
+    candle,
+    vwap_state,
+    positions,
+    exit_position
+):
+    pos = positions.get(token)
+    if not pos or not pos.get("open"):
+        return
+
+    vwap = vwap_state.get(token, {}).get("vwap")
+    if not vwap:
+        return
+
+    close = candle["close"]
+
+    if pos["direction"] == "LONG" and close < vwap:
+        logger.info(
+            f"EXIT SIGNAL | VWAP RECROSS | token={token} | close={close} < VWAP={round(vwap,2)}"
+        )
+        exit_position(positions, token, close, "VWAP_RECROSS")
+
+    elif pos["direction"] == "SHORT" and close > vwap:
+        logger.info(
+            f"EXIT SIGNAL | VWAP RECROSS | token={token} | close={close} > VWAP={round(vwap,2)}"
+        )
+        exit_position(positions, token, close, "VWAP_RECROSS")
+
+
+def _check_trailing_sl(
+    *,
+    token,
+    candle,
+    positions,
+    token_meta,
+    exit_position
+):
+    pos = positions.get(token)
+    if not pos or not pos.get("open"):
+        return
+
+    index = token_meta[token]["index"]
+    trail_points = DEFAULT_TRAIL_POINTS.get(index)
+    if not trail_points:
+        return
+
+    close = candle["close"]
+
+    # Initialize best price if missing
+    best = pos.setdefault("best_price", pos["entry_price"])
 
     if pos["direction"] == "LONG":
-        pos["best_price"] = max(pos["best_price"], ltp)
+        pos["best_price"] = max(best, close)
+        if pos["best_price"] - close >= trail_points:
+            logger.info(
+                f"EXIT SIGNAL | TRAIL SL | token={token} | "
+                f"best={pos['best_price']} close={close}"
+            )
+            exit_position(positions, token, close, "TRAIL_SL")
 
-        if pos["best_price"] - ltp >= trail:
-            return {
-                "token": token,
-                "price": ltp,
-                "reason": "TRAILING_SL"
-            }
+    elif pos["direction"] == "SHORT":
+        pos["best_price"] = min(best, close)
+        if close - pos["best_price"] >= trail_points:
+            logger.info(
+                f"EXIT SIGNAL | TRAIL SL | token={token} | "
+                f"best={pos['best_price']} close={close}"
+            )
+            exit_position(positions, token, close, "TRAIL_SL")
 
-    else:  # SHORT
-        pos["best_price"] = min(pos["best_price"], ltp)
 
-        if ltp - pos["best_price"] >= trail:
-            return {
-                "token": token,
-                "price": ltp,
-                "reason": "TRAILING_SL"
-            }
-
-    return None
-
-# ============================================================
-# TIME EXIT
-# ============================================================
-
-def check_time_exit(
-    positions,
+def _check_time_exit(
+    *,
     token,
-    candle_time,
-    price
+    candle,
+    positions,
+    exit_position
 ):
-    """
-    Force exit after TIME_EXIT.
-    """
-
     pos = positions.get(token)
-    if not pos or not pos["open"]:
-        return None
+    if not pos or not pos.get("open"):
+        return
 
-    if candle_time.time() >= TIME_EXIT:
-        return {
-            "token": token,
-            "price": price,
-            "reason": "TIME_EXIT"
-        }
+    candle_time = candle["start"].time()
 
-    return None
+    if candle_time >= HARD_EXIT_TIME:
+        logger.info(
+            f"EXIT SIGNAL | TIME EXIT | token={token} | time={candle_time}"
+        )
+        exit_position(
+            positions,
+            token,
+            candle["close"],
+            "TIME_EXIT"
+        )
