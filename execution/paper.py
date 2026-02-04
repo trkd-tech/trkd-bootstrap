@@ -53,6 +53,13 @@ def enter_position(
     }
     """
 
+    # --- Defensive validation ---
+    required_keys = {"strategy", "direction", "price", "time"}
+    if not required_keys.issubset(signal):
+        logger.error(f"INVALID SIGNAL RECEIVED | token={token} | signal={signal}")
+        return False
+
+    # --- One open position per token ---
     if token in positions and positions[token]["open"]:
         return False
 
