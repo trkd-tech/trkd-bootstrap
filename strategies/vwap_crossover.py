@@ -24,12 +24,11 @@ This module MUST:
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
 STRATEGY_NAME = "VWAP_CROSSOVER"
-
 HARD_START = datetime.strptime("09:45", "%H:%M").time()
 
 # ============================================================
@@ -66,7 +65,12 @@ def evaluate_vwap_crossover(
         }
     """
 
+    # --- Safety checks ---
     if not prev_candle:
+        return None
+
+    # Ensure candles are sequential (5-minute gap)
+    if candle["start"] - prev_candle["start"] != timedelta(minutes=5):
         return None
 
     if token not in vwap_state or vwap_state[token].get("vwap") is None:
@@ -82,11 +86,7 @@ def evaluate_vwap_crossover(
     ).time()
 
     # --- Time filters ---
-    if t < HARD_START:
-        return None
-    if t < trade_after:
-        return None
-    if t > trade_before:
+    if t < HARD_START or t < trade_after or t > trade_before:
         return None
 
     today = candle["start"].date()
