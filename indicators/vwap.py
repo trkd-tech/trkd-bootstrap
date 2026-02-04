@@ -1,83 +1,112 @@
 """
-vwap.py
+indicators/vwap.py
 
-Indicator: VWAP (Volume Weighted Average Price)
+VWAP indicator logic.
 
 Responsibilities:
-- Maintain session VWAP state
-- Extend VWAP using closed candles (Track A)
-- Start from backfilled state if present (Track B)
+- Maintain running VWAP state from candles
+- Provide a single, consistent VWAP calculation method
+- Be reusable by:
+  - Track A (live 5m candles)
+  - Track B (historical backfill)
 
-This module:
-- Does NOT fetch historical data
-- Does NOT evaluate strategies
-- Does NOT place trades
+This module MUST:
+- Not know about strategies
+- Not know about orders / execution
+- Not fetch historical data
 """
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # ============================================================
-# VWAP UPDATE LOGIC
+# VWAP STATE SHAPE
+# ============================================================
+# vwap_state[token] = {
+#     "cum_pv": float,
+#     "cum_vol": int,
+#     "vwap": float
+# }
+
+# ============================================================
+# CORE VWAP UPDATE
 # ============================================================
 
-def update_vwap_from_candle(vwap_state, token, candle):
+def update_vwap_from_candle(token, candle, vwap_state):
     """
-    Update VWAP using a closed candle.
+    Update VWAP using a single completed candle.
 
-    Args:
-        vwap_state (dict): global vwap_state
-        token (int): instrument token
-        candle (dict): closed candle with high, low, close, volume
-
-    Expected candle structure:
+    Candle requirements:
     {
-        "start": datetime,
-        "open": float,
         "high": float,
         "low": float,
         "close": float,
         "volume": int
     }
+
+    This function MUTATES vwap_state[token].
     """
 
-    # Typical price for the candle
-    typical_price = (
-        candle["high"] +
-        candle["low"] +
-        candle["close"]
-    ) / 3
+    volume = candle.get("volume", 0)
+    if volume <= 0:
+        logger.debug(f"VWAP SKIP | token={token} | zero volume candle")
+        return
 
-    pv = typical_price * candle["volume"]
+    typical_price = (
+        candle["high"] + candle["low"] + candle["close"]
+    ) / 3.0
+
+    pv = typical_price * volume
 
     state = vwap_state.setdefault(
         token,
-        {
-            "cum_pv": 0.0,
-            "cum_vol": 0,
-            "vwap": None
-        }
+        {"cum_pv": 0.0, "cum_vol": 0, "vwap": None}
     )
 
     state["cum_pv"] += pv
-    state["cum_vol"] += candle["volume"]
+    state["cum_vol"] += volume
+    state["vwap"] = state["cum_pv"] / state["cum_vol"]
 
-    # Guard against zero volume
-    if state["cum_vol"] > 0:
-        state["vwap"] = state["cum_pv"] / state["cum_vol"]
-
-    return state["vwap"]
+    logger.debug(
+        f"VWAP UPDATE | token={token} | "
+        f"tp={round(typical_price,2)} | "
+        f"vol={volume} | "
+        f"vwap={round(state['vwap'],2)}"
+    )
 
 
 # ============================================================
-# READ-ONLY ACCESSOR
+# READ HELPERS
 # ============================================================
 
-def get_vwap(vwap_state, token):
+def get_vwap(token, vwap_state):
     """
-    Safe accessor for current VWAP.
-
-    Returns:
-        float | None
+    Safe VWAP getter.
+    Returns None if VWAP not available yet.
     """
-    state = vwap_state.get(token)
-    if not state:
+    s = vwap_state.get(token)
+    if not s:
         return None
-    return state.get("vwap")
+    return s.get("vwap")
+
+
+def has_vwap(token, vwap_state):
+    """
+    Returns True if VWAP is initialized for token.
+    """
+    return token in vwap_state and vwap_state[token].get("vwap") is not None
+
+
+# ============================================================
+# RESET (SESSION BOUNDARY)
+# ============================================================
+
+def reset_vwap(token, vwap_state):
+    """
+    Reset VWAP state for a token.
+    Intended to be used at session boundary (future).
+    """
+    if token in vwap_state:
+        del vwap_state[token]
+        logger.info(f"VWAP RESET | token={token}")
