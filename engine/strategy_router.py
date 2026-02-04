@@ -1,84 +1,88 @@
 """
 engine/strategy_router.py
 
-Central strategy evaluation router.
+Routes completed candles to enabled strategies using
+per-strategy configuration loaded at runtime.
 
 Responsibilities:
-- Invoke enabled strategies
-- Enforce candle sequencing safety
-- Normalize strategy outputs
-- Isolate strategy failures (one strategy must NOT break others)
+- Decide WHICH strategies run
+- Pass correct inputs + config to each strategy
+- Collect and return emitted signals
 
 This module MUST:
 - Not place trades
 - Not manage positions
-- Not update indicators
+- Not compute indicators
 """
 
 import logging
-from datetime import timedelta
 
-from strategies.orb import evaluate_orb
-from strategies.vwap_crossover import evaluate_vwap_crossover
+from strategies.orb import evaluate_orb, STRATEGY_NAME as ORB_NAME
+from strategies.vwap_crossover import (
+    evaluate_vwap_crossover,
+    STRATEGY_NAME as VWAP_CROSS_NAME
+)
 
 logger = logging.getLogger(__name__)
 
 # ============================================================
 # STRATEGY REGISTRY
 # ============================================================
+# Maps strategy name → evaluation function
+# Adding a new strategy = add one line here
+# ============================================================
 
 STRATEGY_REGISTRY = {
-    "VWAP_ORB": evaluate_orb,
-    "VWAP_CROSSOVER": evaluate_vwap_crossover
+    ORB_NAME: evaluate_orb,
+    VWAP_CROSS_NAME: evaluate_vwap_crossover,
 }
 
 # ============================================================
 # ROUTER
 # ============================================================
 
-def evaluate_strategies(
+def route_strategies(
+    *,
     token,
     candle,
-    candles_5m,
+    prev_candle,
     vwap_state,
     opening_range,
     strategy_state,
-    strategies_config
+    strategy_config
 ):
     """
-    Evaluate all enabled strategies on a completed 5-minute candle.
+    Route a completed candle to all enabled strategies.
 
     Args:
         token: instrument token
-        candle: current closed 5-minute candle
-        candles_5m: dict[(token, datetime)] -> candle
+        candle: current completed candle (dict)
+        prev_candle: previous candle of same timeframe or None
         vwap_state: shared VWAP state
         opening_range: shared OR state
-        strategy_state: shared per-strategy state
-        strategies_config: global strategy config
+        strategy_state: mutable per-strategy state
+        strategy_config: dict loaded from config_loader
 
     Returns:
-        List of strategy signal dicts
+        List of emitted signals (possibly empty)
     """
 
     signals = []
 
-    # Resolve previous 5-minute candle safely
-    prev_key = (token, candle["start"] - timedelta(minutes=5))
-    prev_candle = candles_5m.get(prev_key)
-
-    for strategy_name, config in strategies_config.items():
+    for strategy_name, config in strategy_config.items():
         if not config.get("enabled", False):
             continue
 
         evaluator = STRATEGY_REGISTRY.get(strategy_name)
         if not evaluator:
-            logger.warning(f"Strategy not registered: {strategy_name}")
+            logger.warning(
+                f"STRATEGY NOT REGISTERED | name={strategy_name}"
+            )
             continue
 
         try:
             # --- ORB ---
-            if strategy_name == "VWAP_ORB":
+            if strategy_name == ORB_NAME:
                 signal = evaluator(
                     token=token,
                     candle=candle,
@@ -88,8 +92,8 @@ def evaluate_strategies(
                     config=config
                 )
 
-            # --- VWAP Crossover ---
-            elif strategy_name == "VWAP_CROSSOVER":
+            # --- VWAP CROSSOVER ---
+            elif strategy_name == VWAP_CROSS_NAME:
                 signal = evaluator(
                     token=token,
                     candle=candle,
@@ -107,8 +111,7 @@ def evaluate_strategies(
 
         except Exception:
             logger.exception(
-                f"Strategy evaluation failed | "
-                f"strategy={strategy_name} | token={token}"
+                f"STRATEGY ERROR | name={strategy_name} | token={token}"
             )
 
     return signals
