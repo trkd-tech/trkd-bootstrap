@@ -8,11 +8,31 @@ Responsibilities:
 - Expiry filtering
 - Avoid strike collisions across strategies
 """
+# execution/option_resolver.py
 
-import logging
-from datetime import timedelta
+from datetime import date
 
-logger = logging.getLogger(__name__)
+# ============================================================
+# STRIKE STEP DISCOVERY
+# ============================================================
+
+def get_strike_step(index, instrument_cache):
+    strikes = sorted({
+        i["strike"]
+        for i in instrument_cache
+        if i["segment"] == "NFO-OPT"
+        and i["name"] == index
+    })
+
+    if len(strikes) < 2:
+        raise RuntimeError(f"Cannot determine strike step for {index}")
+
+    return strikes[1] - strikes[0]
+
+
+# ============================================================
+# OPTION RESOLUTION
+# ============================================================
 
 def resolve_option(
     *,
@@ -23,6 +43,13 @@ def resolve_option(
     positions,
     min_expiry_days
 ):
+    """
+    Resolve an option instrument respecting:
+    - ATM proximity
+    - Strike conflicts with other strategies
+    - Minimum expiry days
+    """
+
     ltp_symbol = f"NSE:{index}"
     ltp = kite_client.ltp(ltp_symbol)[ltp_symbol]["last_price"]
 
@@ -30,9 +57,11 @@ def resolve_option(
     atm = round(ltp / step) * step
 
     used_strikes = {
-        p["strike"]
-        for p in positions.values()
-        if p["index"] == index and p["direction"] == direction and p["open"]
+        pos["strike"]
+        for pos in positions.values()
+        if pos["index"] == index
+        and pos["direction"] == direction
+        and pos["open"]
     }
 
     option_type = "CE" if direction == "LONG" else "PE"
@@ -45,6 +74,7 @@ def resolve_option(
         and (i["expiry"] - date.today()).days >= min_expiry_days
     ]
 
+    # Closest expiry first, then closest strike
     candidates.sort(key=lambda x: (x["expiry"], abs(x["strike"] - atm)))
 
     for c in candidates:
