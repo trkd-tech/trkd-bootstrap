@@ -135,16 +135,35 @@ def evaluate_orb(
 # CONFIG HELPERS
 # ============================================================
 
-def _get_trade_limit(config, base_key, index):
+def _get_trade_limit(config, base_key, index, strategy_name):
     """
-    Resolve per-index trade limit.
+    Resolve per-strategy × per-index trade limit.
 
-    Priority:
-    1. max_trades_per_day_long_nifty
-    2. max_trades_per_day_long (fallback)
+    Resolution order:
+    1. max_trades_per_day_<dir>_<index>_<strategy>
+    2. max_trades_per_day_<dir>_<index>
+    3. max_trades_per_day_<dir>
+    4. default = 1
     """
-    index_key = f"{base_key}_{index.lower()}"
-    if index_key in config:
-        return int(config.get(index_key, 0))
 
-    return int(config.get(base_key, 1))
+    strategy = strategy_name.lower()
+    index = index.lower() if index else None
+
+    # 1️⃣ strategy + index
+    if index:
+        k1 = f"{base_key}_{index}_{strategy}"
+        if k1 in config:
+            return int(config[k1])
+
+    # 2️⃣ index only
+    if index:
+        k2 = f"{base_key}_{index}"
+        if k2 in config:
+            return int(config[k2])
+
+    # 3️⃣ global
+    if base_key in config:
+        return int(config[base_key])
+
+    # 4️⃣ default
+    return 1
