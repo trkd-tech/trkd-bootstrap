@@ -57,16 +57,16 @@ def route_strategies(
 
     Args:
         token: instrument token
-        candle: completed candle dict
-        prev_candle: previous candle or None
+        candle: completed 5-minute candle (dict)
+        prev_candle: previous 5-minute candle or None
         vwap_state: shared VWAP state
-        opening_range: shared Opening Range state
-        token_meta: token → {index, ...}
+        opening_range: shared OR state
+        token_meta: token → {index: str}
         strategy_state: mutable per-strategy state
         strategy_config: dict loaded from STRATEGY_CONFIG sheet
 
     Returns:
-        List of emitted signals (possibly empty)
+        List[signal_dict]
     """
 
     signals = []
@@ -75,8 +75,6 @@ def route_strategies(
         return signals
 
     for strategy_name, config in strategy_config.items():
-
-        # --- Strategy enable flag ---
         if not config.get("enabled", False):
             continue
 
@@ -88,7 +86,9 @@ def route_strategies(
             continue
 
         try:
-            # --- ORB Strategy ---
+            # ------------------------------------------------
+            # ORB STRATEGY
+            # ------------------------------------------------
             if strategy_name == ORB_NAME:
                 signal = evaluator(
                     token=token,
@@ -100,7 +100,9 @@ def route_strategies(
                     config=config
                 )
 
-            # --- VWAP Crossover Strategy ---
+            # ------------------------------------------------
+            # VWAP CROSSOVER STRATEGY
+            # ------------------------------------------------
             elif strategy_name == VWAP_CROSS_NAME:
                 signal = evaluator(
                     token=token,
@@ -113,6 +115,7 @@ def route_strategies(
                 )
 
             else:
+                # Should never happen due to registry check
                 continue
 
             if signal:
