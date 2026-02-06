@@ -1,6 +1,7 @@
 # execution/live.py
 
 import logging
+from execution.position_sync import sync_positions_from_kite
 
 logger = logging.getLogger(__name__)
 
@@ -11,7 +12,19 @@ class LiveEngine:
         self.kite = kite_client
         self.positions = positions
 
+    def sync(self):
+        """
+        Reconcile runtime positions with Kite.
+        """
+        sync_positions_from_kite(self.kite, self.positions)
+
     def enter_position(self, *, token, signal, qty, option):
+        """
+        Place a live market order via Kite and store strategy-scoped position.
+        """
+
+        self.sync()  # 🔒 ALWAYS sync before placing live orders
+
         tradingsymbol = option["tradingsymbol"]
 
         order_id = self.kite.place_order(
@@ -28,8 +41,12 @@ class LiveEngine:
             order_type=self.kite.ORDER_TYPE_MARKET
         )
 
-        self.positions[(signal["strategy"], option["name"])] = {
+        # Strategy-scoped position key
+        position_key = (signal["strategy"], tradingsymbol)
+
+        self.positions[position_key] = {
             "strategy": signal["strategy"],
+            "token": token,
             "index": option["name"],
             "direction": signal["direction"],
             "tradingsymbol": tradingsymbol,
@@ -45,3 +62,5 @@ class LiveEngine:
             f"LIVE ENTRY | {signal['strategy']} | "
             f"{tradingsymbol} | qty={qty} | order_id={order_id}"
         )
+
+        return order_id
