@@ -220,11 +220,13 @@ def on_minute_close(token, closed_minute):
 
     # --- Paper execution ---
     for signal in signals:
-        enter_position(
-            positions,
-            token,
+        route_signal(
             signal,
-            qty=1
+            token_meta,
+            execution_config,
+            paper_engine=PaperEngine(),
+            live_engine=LiveEngine(),
+            live_trading_enabled=LIVE_TRADING_ENABLED
         )
 
     # --- Risk / exits ---
