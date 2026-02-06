@@ -67,20 +67,6 @@ Strategy configuration is pulled from the `STRATEGY_CONFIG` Google Sheet.
 The configuration is loaded once per IST day unless a reload is forced via
 the `/reload-config` endpoint.
 
-Per-direction trade limits can be set per index using:
-- `max_trades_per_day_long` / `max_trades_per_day_short`
-- or index-specific overrides like `max_trades_per_day_long_NIFTY`.
-
-## Performance Tracking (Signals Only)
-
-Signals are tracked using the ATM option LTP at the time the signal is generated.
-The runtime updates marks on each 5-minute candle to keep an in-memory P&L per
-signal (no actual trades are placed).
-
-For durable performance analytics across periods (1D, 1W, 1M, 1Q, YTD, 1Y,
-custom), persist the signal records to a database (e.g., Postgres or BigQuery)
-and visualize via a dashboard (e.g., Metabase, Superset, or a custom web UI).
-
 ## Quick Reference: Key Files
 
 - `main.py`: Application entrypoint (modular orchestration)
@@ -92,4 +78,3 @@ and visualize via a dashboard (e.g., Metabase, Superset, or a custom web UI).
 - `engine/`: Config loader + strategy routing
 - `execution/paper.py`: Paper trading
 - `risk/exits.py`: Exit logic
-- `performance/tracker.py`: Signal P&L tracking (in-memory)
