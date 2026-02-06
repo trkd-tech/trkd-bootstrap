@@ -49,6 +49,7 @@ def evaluate_vwap_crossover(
     candle,
     prev_candle,
     vwap_state,
+    token_meta,
     strategy_state,
     config
 ):
@@ -103,7 +104,9 @@ def evaluate_vwap_crossover(
         strat_state["LONG"] = 0
         strat_state["SHORT"] = 0
 
-    max_trades = config.get("max_trades_per_day", 1)
+    index = token_meta.get(token, {}).get("index")
+    max_trades_long = _get_trade_limit(config, "max_trades_per_day_long", index, STRATEGY_NAME)
+    max_trades_short = _get_trade_limit(config, "max_trades_per_day_short", index, STRATEGY_NAME)
     allowed_dir = config.get("direction", "BOTH")
 
     prev_close = prev_candle["close"]
@@ -117,7 +120,7 @@ def evaluate_vwap_crossover(
         prev_close < vwap and
         close > vwap and
         allowed_dir in ("UP", "BOTH") and
-        strat_state["LONG"] < max_trades
+        strat_state["LONG"] < max_trades_long
     ):
         signal = "LONG"
         strat_state["LONG"] += 1
@@ -127,7 +130,7 @@ def evaluate_vwap_crossover(
         prev_close > vwap and
         close < vwap and
         allowed_dir in ("DOWN", "BOTH") and
-        strat_state["SHORT"] < max_trades
+        strat_state["SHORT"] < max_trades_short
     ):
         signal = "SHORT"
         strat_state["SHORT"] += 1
@@ -148,3 +151,13 @@ def evaluate_vwap_crossover(
         "price": close,
         "time": candle["start"]
     }
+
+
+def _get_trade_limit(config, base_key, index, strategy_name):
+    strategy = strategy_name.lower()
+    if index:
+        index_key = index.lower()
+        indexed_key = f"{base_key}_{index_key}_{strategy}"
+        if indexed_key in config:
+            return int(config.get(indexed_key, 0))
+    return int(config.get(base_key, 1))

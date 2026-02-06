@@ -48,6 +48,7 @@ def route_strategies(
     prev_candle,
     vwap_state,
     opening_range,
+    token_meta,
     strategy_state,
     strategy_config
 ):
@@ -88,6 +89,7 @@ def route_strategies(
                     candle=candle,
                     vwap_state=vwap_state,
                     opening_range=opening_range,
+                    token_meta=token_meta,
                     strategy_state=strategy_state,
                     config=config
                 )
@@ -99,6 +101,7 @@ def route_strategies(
                     candle=candle,
                     prev_candle=prev_candle,
                     vwap_state=vwap_state,
+                    token_meta=token_meta,
                     strategy_state=strategy_state,
                     config=config
                 )
