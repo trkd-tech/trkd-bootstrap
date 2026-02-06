@@ -17,6 +17,10 @@ This module MUST:
 
 import logging
 
+from db.session import db_session
+from db.repository import TradeRepository, PositionRepository
+from data.time_utils import normalize_ist_naive, now_ist
+
 logger = logging.getLogger(__name__)
 
 # ============================================================
@@ -59,6 +63,12 @@ def enter_position(
         logger.error(f"INVALID SIGNAL RECEIVED | token={token} | signal={signal}")
         return False
 
+    signal_time = signal.get("time")
+    if signal_time:
+        signal_time = normalize_ist_naive(signal_time)
+    else:
+        signal_time = now_ist()
+
     # --- One open position per token ---
     if token in positions and positions[token]["open"]:
         return False
@@ -71,6 +81,11 @@ def enter_position(
         "qty": qty,
         "open": True
     }
+
+    trade_id = _build_trade_id(signal["strategy"], token, signal_time)
+
+    _log_trade_entry(signal, token, trade_id, qty, signal_time)
+    _log_position_open(signal, token, trade_id, qty, signal_time)
 
     logger.info(
         f"PAPER ENTRY | {signal['strategy']} | "
@@ -106,6 +121,11 @@ def exit_position(
 
     pos["open"] = False
 
+    trade_id = _build_trade_id(pos["strategy"], token, pos["entry_time"])
+
+    _log_trade_exit(trade_id, price, reason, pnl)
+    _log_position_close(trade_id, price, pnl)
+
     logger.info(
         f"PAPER EXIT | {pos['strategy']} | "
         f"token={token} | reason={reason} | "
@@ -124,3 +144,77 @@ def has_open_position(positions, token):
 def get_open_position(positions, token):
     pos = positions.get(token)
     return pos if pos and pos["open"] else None
+
+
+def _build_trade_id(strategy, token, dt):
+    if dt is None:
+        dt = now_ist()
+    dt = normalize_ist_naive(dt)
+    return f"{strategy}-{token}-{dt.strftime('%Y%m%d')}-{dt.strftime('%H%M')}"
+
+
+def _log_trade_entry(signal, token, trade_id, qty, entry_time):
+    try:
+        with db_session() as session:
+            if session is None:
+                return
+            TradeRepository(session).upsert_trade_entry(
+                trade_id=trade_id,
+                strategy=signal["strategy"],
+                token=token,
+                index=signal.get("index", "UNKNOWN"),
+                direction=signal["direction"],
+                qty=qty,
+                entry_price=signal["price"],
+                entry_time=entry_time
+            )
+    except Exception:
+        logger.exception("DB trade entry write failed (non-fatal)")
+
+
+def _log_trade_exit(trade_id, exit_price, exit_reason, pnl):
+    try:
+        with db_session() as session:
+            if session is None:
+                return
+            TradeRepository(session).update_trade_exit(
+                trade_id=trade_id,
+                exit_price=exit_price,
+                exit_reason=exit_reason,
+                pnl=pnl
+            )
+    except Exception:
+        logger.exception("DB trade exit write failed (non-fatal)")
+
+
+def _log_position_open(signal, token, position_id, qty, entry_time):
+    try:
+        with db_session() as session:
+            if session is None:
+                return
+            PositionRepository(session).upsert_position(
+                position_id=position_id,
+                token=token,
+                strategy=signal["strategy"],
+                index=signal.get("index", "UNKNOWN"),
+                direction=signal["direction"],
+                qty=qty,
+                entry_price=signal["price"],
+                entry_time=entry_time
+            )
+    except Exception:
+        logger.exception("DB position open write failed (non-fatal)")
+
+
+def _log_position_close(position_id, exit_price, pnl):
+    try:
+        with db_session() as session:
+            if session is None:
+                return
+            PositionRepository(session).close_position(
+                position_id=position_id,
+                exit_price=exit_price,
+                pnl=pnl
+            )
+    except Exception:
+        logger.exception("DB position close write failed (non-fatal)")

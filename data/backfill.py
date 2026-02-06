@@ -15,7 +15,9 @@ This module MUST:
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
+
+from data.time_utils import IST, now_ist
 
 logger = logging.getLogger(__name__)
 
@@ -23,15 +25,8 @@ logger = logging.getLogger(__name__)
 # IST HANDLING
 # ============================================================
 
-IST_OFFSET = timedelta(hours=5, minutes=30)
-IST = timezone(IST_OFFSET)
-
 OR_START = datetime.strptime("09:15", "%H:%M").time()
 OR_END   = datetime.strptime("09:45", "%H:%M").time()
-
-
-def now_ist():
-    return datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(IST)
 
 # ============================================================
 # VWAP BACKFILL
