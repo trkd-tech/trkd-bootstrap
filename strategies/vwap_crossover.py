@@ -6,21 +6,21 @@ VWAP Crossover strategy.
 Entry Logic (5-minute candles):
 - Candle closes ABOVE VWAP and previous candle closed BELOW VWAP → LONG
 - Candle closes BELOW VWAP and previous candle closed ABOVE VWAP → SHORT
-- Time filter:
-    - Not before 09:45 (hard floor)
-    - Must be >= trade_after (user config)
-    - Must be <= trade_before (user config)
+- Time filters:
+    - Hard floor: not before 09:45
+    - Must be >= trade_after (config)
+    - Must be <= trade_before (config)
 - Direction filter: UP / DOWN / BOTH
-- Max trades per direction per day
+- Per-day trade limits enforced per strategy × index × direction
 
 Exit Logic:
-- Reverse VWAP crossover
-- Time-based exits handled elsewhere
-- Trailing SL handled elsewhere
+- Reverse VWAP crossover (handled elsewhere)
+- Time exits handled by risk engine
+- Trailing SL handled by risk engine
 
 This module MUST:
 - Not place trades
-- Only emit signals
+- Only emit strategy signals
 """
 
 import logging
@@ -45,6 +45,7 @@ HARD_START = datetime.strptime("09:45", "%H:%M").time()
 # ============================================================
 
 def evaluate_vwap_crossover(
+    *,
     token,
     candle,
     prev_candle,
@@ -66,15 +67,22 @@ def evaluate_vwap_crossover(
         }
     """
 
-    # --- Safety checks ---
+    # --------------------------------------------------------
+    # SAFETY CHECKS
+    # --------------------------------------------------------
+
     if not prev_candle:
         return None
 
-    # Ensure candles are sequential (5-minute gap)
+    # Ensure sequential 5-minute candles
     if candle["start"] - prev_candle["start"] != timedelta(minutes=5):
         return None
 
     if token not in vwap_state or vwap_state[token].get("vwap") is None:
+        return None
+
+    index = token_meta.get(token, {}).get("index")
+    if not index:
         return None
 
     t = candle["start"].time()
@@ -82,11 +90,15 @@ def evaluate_vwap_crossover(
     trade_after = datetime.strptime(
         config.get("trade_after", "09:45"), "%H:%M"
     ).time()
+
     trade_before = datetime.strptime(
         config.get("trade_before", "15:00"), "%H:%M"
     ).time()
 
-    # --- Time filters ---
+    # --------------------------------------------------------
+    # TIME FILTERS
+    # --------------------------------------------------------
+
     if t < HARD_START or t < trade_after or t > trade_before:
         return None
 
@@ -98,15 +110,33 @@ def evaluate_vwap_crossover(
         {"date": today, "LONG": 0, "SHORT": 0}
     )
 
-    # Reset per day
+    # --------------------------------------------------------
+    # DAILY RESET
+    # --------------------------------------------------------
+
     if strat_state["date"] != today:
         strat_state["date"] = today
         strat_state["LONG"] = 0
         strat_state["SHORT"] = 0
 
-    index = token_meta.get(token, {}).get("index")
-    max_trades_long = _get_trade_limit(config, "max_trades_per_day_long", index)
-    max_trades_short = _get_trade_limit(config, "max_trades_per_day_short", index)
+    # --------------------------------------------------------
+    # TRADE LIMITS (strategy × index × direction)
+    # --------------------------------------------------------
+
+    max_long = _get_trade_limit(
+        config,
+        base_key="max_trades_per_day_long",
+        index=index,
+        strategy=STRATEGY_NAME
+    )
+
+    max_short = _get_trade_limit(
+        config,
+        base_key="max_trades_per_day_short",
+        index=index,
+        strategy=STRATEGY_NAME
+    )
+
     allowed_dir = config.get("direction", "BOTH")
 
     prev_close = prev_candle["close"]
@@ -115,12 +145,16 @@ def evaluate_vwap_crossover(
 
     signal = None
 
+    # --------------------------------------------------------
+    # SIGNAL LOGIC
+    # --------------------------------------------------------
+
     # --- LONG crossover ---
     if (
         prev_close < vwap and
         close > vwap and
         allowed_dir in ("UP", "BOTH") and
-        strat_state["LONG"] < max_trades_long
+        strat_state["LONG"] < max_long
     ):
         signal = "LONG"
         strat_state["LONG"] += 1
@@ -130,7 +164,7 @@ def evaluate_vwap_crossover(
         prev_close > vwap and
         close < vwap and
         allowed_dir in ("DOWN", "BOTH") and
-        strat_state["SHORT"] < max_trades_short
+        strat_state["SHORT"] < max_short
     ):
         signal = "SHORT"
         strat_state["SHORT"] += 1
@@ -139,9 +173,9 @@ def evaluate_vwap_crossover(
         return None
 
     logger.info(
-        f"VWAP CROSS SIGNAL | token={token} | "
-        f"{signal} | close={close} | VWAP={round(vwap,2)} | "
-        f"time={candle['start'].time()}"
+        f"VWAP CROSS SIGNAL | token={token} | index={index} | "
+        f"{signal} | close={close} | "
+        f"VWAP={round(vwap, 2)} | time={t}"
     )
 
     return {
@@ -152,36 +186,40 @@ def evaluate_vwap_crossover(
         "time": candle["start"]
     }
 
+# ============================================================
+# HELPERS
+# ============================================================
 
-def _get_trade_limit(config, base_key, index, strategy_name):
+def _get_trade_limit(config, base_key, index, strategy):
     """
-    Resolve per-strategy × per-index trade limit.
+    Resolve trade limits in the following priority order:
 
-    Resolution order:
-    1. max_trades_per_day_<dir>_<index>_<strategy>
-    2. max_trades_per_day_<dir>_<index>
-    3. max_trades_per_day_<dir>
-    4. default = 1
+    1. max_trades_per_day_<direction>_<index>_<strategy>
+       e.g. max_trades_per_day_long_nifty_vwap_crossover
+
+    2. max_trades_per_day_<direction>_<strategy>
+       e.g. max_trades_per_day_long_vwap_crossover
+
+    3. max_trades_per_day_<direction>
+       e.g. max_trades_per_day_long
+
+    4. Default = 1
     """
 
-    strategy = strategy_name.lower()
-    index = index.lower() if index else None
+    index = index.lower()
+    strategy = strategy.lower()
 
-    # 1️⃣ strategy + index
-    if index:
-        k1 = f"{base_key}_{index}_{strategy}"
-        if k1 in config:
-            return int(config[k1])
+    keys = [
+        f"{base_key}_{index}_{strategy}",
+        f"{base_key}_{strategy}",
+        f"{base_key}",
+    ]
 
-    # 2️⃣ index only
-    if index:
-        k2 = f"{base_key}_{index}"
-        if k2 in config:
-            return int(config[k2])
+    for key in keys:
+        if key in config:
+            try:
+                return int(config[key])
+            except (TypeError, ValueError):
+                pass
 
-    # 3️⃣ global
-    if base_key in config:
-        return int(config[base_key])
-
-    # 4️⃣ default
     return 1
