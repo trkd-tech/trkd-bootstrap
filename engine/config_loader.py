@@ -17,6 +17,8 @@ This module MUST:
 import logging
 from datetime import datetime
 
+from data.time_utils import now_ist
+
 logger = logging.getLogger(__name__)
 
 # ============================================================
@@ -101,3 +103,112 @@ def load_strategy_config(gspread_client, sheet_id):
         )
 
     return config
+
+
+_cached_config = {}
+_last_loaded_date = None
+_cached_exec_config = {}
+_last_exec_loaded_date = None
+
+
+def get_strategy_config(
+    gspread_client,
+    sheet_id,
+    *,
+    force_reload=False
+):
+    """
+    Load strategy config once per IST day unless force_reload is True.
+    """
+    global _cached_config, _last_loaded_date
+
+    today = now_ist().date()
+
+    if force_reload or _last_loaded_date != today:
+        _cached_config = load_strategy_config(gspread_client, sheet_id)
+        _last_loaded_date = today
+
+    return _cached_config
+
+
+def _normalize_mode(value):
+    if not value:
+        return None
+    return str(value).strip().upper()
+
+
+def load_execution_config(gspread_client, sheet_id):
+    """
+    Load per-strategy execution configuration from Google Sheet.
+
+    Returns:
+        dict[(strategy_name, index)] = {
+            "mode": "LIVE" | "PAPER" | "OFF",
+            "qty": int,
+            "enabled": bool
+        }
+    """
+    sh = gspread_client.open_by_key(sheet_id)
+    ws = sh.worksheet("STRATEGY_EXECUTION")
+
+    rows = ws.get_all_records()
+
+    config = {}
+
+    for row in rows:
+        strategy = row.get("strategy_name")
+        index = row.get("index")
+        mode = _normalize_mode(row.get("mode"))
+        qty = row.get("qty")
+        enabled = row.get("enabled")
+
+        if not strategy or not index:
+            logger.warning(f"EXEC CONFIG INVALID ROW | missing strategy/index | row={row}")
+            continue
+
+        if mode not in {"LIVE", "PAPER", "OFF"}:
+            logger.warning(f"EXEC CONFIG INVALID MODE | {strategy} | {index} | mode={mode}")
+            continue
+
+        try:
+            qty = int(qty)
+        except (TypeError, ValueError):
+            logger.warning(f"EXEC CONFIG INVALID QTY | {strategy} | {index} | qty={qty}")
+            continue
+
+        if qty <= 0:
+            logger.warning(f"EXEC CONFIG INVALID QTY | {strategy} | {index} | qty={qty}")
+            continue
+
+        config[(strategy, index)] = {
+            "mode": mode,
+            "qty": qty,
+            "enabled": bool(enabled)
+        }
+
+    for key, cfg in config.items():
+        logger.info(
+            f"EXEC CONFIG LOADED | {key[0]} | {key[1]} | mode={cfg['mode']} | qty={cfg['qty']} | enabled={cfg['enabled']}"
+        )
+
+    return config
+
+
+def get_execution_config(
+    gspread_client,
+    sheet_id,
+    *,
+    force_reload=False
+):
+    """
+    Load execution config once per IST day unless force_reload is True.
+    """
+    global _cached_exec_config, _last_exec_loaded_date
+
+    today = now_ist().date()
+
+    if force_reload or _last_exec_loaded_date != today:
+        _cached_exec_config = load_execution_config(gspread_client, sheet_id)
+        _last_exec_loaded_date = today
+
+    return _cached_exec_config
