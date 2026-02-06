@@ -93,12 +93,12 @@ def evaluate_orb(
 
     index = token_meta.get(token, {}).get("index")
     if close > or_high and close > vwap:
-        max_long = _get_trade_limit(config, "max_trades_per_day_long", index, STRATEGY_NAME)
+        max_long = _get_trade_limit(config, "max_trades_per_day_long", index)
         if strat_state["LONG"] < max_long:
             signal = "LONG"
             strat_state["LONG"] += 1
     elif close < or_low and close < vwap:
-        max_short = _get_trade_limit(config, "max_trades_per_day_short", index, STRATEGY_NAME)
+        max_short = _get_trade_limit(config, "max_trades_per_day_short", index)
         if strat_state["SHORT"] < max_short:
             signal = "SHORT"
             strat_state["SHORT"] += 1
@@ -121,11 +121,9 @@ def evaluate_orb(
     }
 
 
-def _get_trade_limit(config, base_key, index, strategy_name):
-    strategy = strategy_name.lower()
+def _get_trade_limit(config, base_key, index):
     if index:
-        index_key = index.lower()
-        indexed_key = f"{base_key}_{index_key}_{strategy}"
+        indexed_key = f"{base_key}_{index}"
         if indexed_key in config:
             return int(config.get(indexed_key, 0))
     return int(config.get(base_key, 1))
