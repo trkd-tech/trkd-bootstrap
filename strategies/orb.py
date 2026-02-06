@@ -7,7 +7,7 @@ Entry Logic:
 - Opening Range must be finalized
 - Candle closes ABOVE OR high AND ABOVE VWAP → LONG
 - Candle closes BELOW OR low AND BELOW VWAP → SHORT
-- Max trades per day enforced per token
+- Per-direction max trades per day (config-driven, per index)
 
 Exit Logic:
 - Handled by risk / execution engine (not here)
@@ -29,7 +29,8 @@ STRATEGY_NAME = "VWAP_ORB"
 # ============================================================
 # strategy_state[token][STRATEGY_NAME] = {
 #     "date": date,
-#     "trades": int
+#     "LONG": int,
+#     "SHORT": int
 # }
 
 # ============================================================
@@ -43,7 +44,7 @@ def evaluate_orb(
     opening_range,
     token_meta,
     strategy_state,
-    config
+    config,
 ):
     """
     Evaluate ORB conditions on a completed candle.
@@ -69,14 +70,17 @@ def evaluate_orb(
     if token not in vwap_state or vwap_state[token].get("vwap") is None:
         return None
 
+    index = token_meta.get(token, {}).get("index")
+    if not index:
+        return None
+
     today = candle["start"].date()
 
     token_state = strategy_state.setdefault(token, {})
-    strat_state = token_state.setdefault(STRATEGY_NAME, {
-        "date": today,
-        "LONG": 0,
-        "SHORT": 0
-    })
+    strat_state = token_state.setdefault(
+        STRATEGY_NAME,
+        {"date": today, "LONG": 0, "SHORT": 0},
+    )
 
     # Reset per new day
     if strat_state["date"] != today:
@@ -91,25 +95,31 @@ def evaluate_orb(
 
     signal = None
 
-    index = token_meta.get(token, {}).get("index")
+    # --- LONG breakout ---
     if close > or_high and close > vwap:
-        max_long = _get_trade_limit(config, "max_trades_per_day_long", index)
+        max_long = _get_trade_limit(
+            config, "max_trades_per_day_long", index
+        )
         if strat_state["LONG"] < max_long:
-            signal = "LONG"
             strat_state["LONG"] += 1
+            signal = "LONG"
+
+    # --- SHORT breakout ---
     elif close < or_low and close < vwap:
-        max_short = _get_trade_limit(config, "max_trades_per_day_short", index)
+        max_short = _get_trade_limit(
+            config, "max_trades_per_day_short", index
+        )
         if strat_state["SHORT"] < max_short:
-            signal = "SHORT"
             strat_state["SHORT"] += 1
+            signal = "SHORT"
 
     if not signal:
         return None
 
     logger.info(
-        f"ORB SIGNAL | token={token} | "
-        f"{signal} | close={close} | "
-        f"OR=({or_low},{or_high}) | VWAP={round(vwap,2)}"
+        f"ORB SIGNAL | token={token} | {signal} | "
+        f"close={close} | OR=({or_low},{or_high}) | "
+        f"VWAP={round(vwap, 2)}"
     )
 
     return {
@@ -117,13 +127,24 @@ def evaluate_orb(
         "token": token,
         "direction": signal,
         "price": close,
-        "time": candle["start"]
+        "time": candle["start"],
     }
 
 
+# ============================================================
+# CONFIG HELPERS
+# ============================================================
+
 def _get_trade_limit(config, base_key, index):
-    if index:
-        indexed_key = f"{base_key}_{index}"
-        if indexed_key in config:
-            return int(config.get(indexed_key, 0))
+    """
+    Resolve per-index trade limit.
+
+    Priority:
+    1. max_trades_per_day_long_nifty
+    2. max_trades_per_day_long (fallback)
+    """
+    index_key = f"{base_key}_{index.lower()}"
+    if index_key in config:
+        return int(config.get(index_key, 0))
+
     return int(config.get(base_key, 1))
