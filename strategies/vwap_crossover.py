@@ -45,29 +45,32 @@ HARD_START = datetime.strptime("09:45", "%H:%M").time()
 # INTERNAL HELPERS
 # ============================================================
 
-def _get_trade_limit(config, base_key, index):
+def get_trade_limit(config, *, base_key, index, strategy):
     """
-    Resolve per-strategy × index trade limit.
+    Resolves trade limits using strict precedence:
 
-    Priority:
-    1. max_trades_per_day_<long|short>_<index>_<strategy>
-    2. max_trades_per_day_<long|short>_<index>
-    3. max_trades_per_day_<long|short>
-    4. default = 1
+    1. base_key_index_strategy
+    2. base_key_strategy
+    3. base_key_index
+    4. base_key
+    5. default = 1
     """
+    keys = []
+
+    if index and strategy:
+        keys.append(f"{base_key}_{index.lower()}_{strategy.lower()}")
+    if strategy:
+        keys.append(f"{base_key}_{strategy.lower()}")
     if index:
-        index = index.lower()
-        strategy = STRATEGY_NAME.lower()
+        keys.append(f"{base_key}_{index.lower()}")
 
-        k1 = f"{base_key}_{index}_{strategy}"
-        if k1 in config:
-            return int(config[k1])
+    keys.append(base_key)
 
-        k2 = f"{base_key}_{index}"
-        if k2 in config:
-            return int(config[k2])
+    for k in keys:
+        if k in config:
+            return int(config[k])
 
-    return int(config.get(base_key, 1))
+    return 1
 
 # ============================================================
 # CORE EVALUATION
@@ -95,7 +98,9 @@ def evaluate_vwap_crossover(
             "time": candle["start"]
         }
     """
-
+    assert "max_trades_per_day" in " ".join(config.keys()), \
+        "Trade limits missing from STRATEGY_CONFIG"
+    
     # --- Safety checks ---
     if not prev_candle:
         return None
