@@ -201,11 +201,11 @@ def start_background_engine():
     token_meta[nifty] = {"index": "NIFTY"}
     token_meta[banknifty] = {"index": "BANKNIFTY"}
 
-    backfill_vwap(kite, nifty, vwap_state)
-    backfill_vwap(kite, banknifty, vwap_state)
+    backfill_vwap(kite_client, nifty, vwap_state)
+    backfill_vwap(kite_client, banknifty, vwap_state)
 
-    backfill_opening_range(kite, nifty, opening_range)
-    backfill_opening_range(kite, banknifty, opening_range)
+    backfill_opening_range(kite_client, nifty, opening_range)
+    backfill_opening_range(kite_client, banknifty, opening_range)
 
     strategy_config = get_strategy_config(
         gspread_client, os.getenv("GOOGLE_SHEET_ID"), force_reload=True
