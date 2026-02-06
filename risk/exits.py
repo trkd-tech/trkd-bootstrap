@@ -44,8 +44,32 @@ def evaluate_exits(
     vwap_state,
     positions,
     token_meta,
-    exit_position
+    exit_position,
+    live_engine=None
 ):
+    # 🔒 Sync with Kite before exits
+    if live_engine:
+        live_engine.sync()
+
+    for key, pos in list(positions.items()):
+        if not pos.get("open"):
+            continue
+
+        if pos["token"] != token:
+            continue
+
+        # Example: VWAP recross exit
+        vwap = vwap_state[token]["vwap"]
+        close = candle["close"]
+
+        if pos["direction"] == "LONG" and close < vwap:
+            exit_position(
+                positions,
+                key,
+                close,
+                reason="VWAP_RECROSS"
+            )
+    
     """
     Evaluate ALL exit conditions for a token on a closed candle.
 
