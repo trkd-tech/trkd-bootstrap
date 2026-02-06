@@ -14,60 +14,41 @@ from datetime import timedelta
 
 logger = logging.getLogger(__name__)
 
-STRIKE_STEP = {
-    "NIFTY": 50,
-    "BANKNIFTY": 100
-}
-
-
 def resolve_option(
     *,
     index,
     direction,
     kite_client,
     instrument_cache,
-    open_positions,
-    min_expiry_days,
+    positions,
+    min_expiry_days
 ):
-    """
-    Returns option instrument dict or None.
-    """
+    ltp_symbol = f"NSE:{index}"
+    ltp = kite_client.ltp(ltp_symbol)[ltp_symbol]["last_price"]
 
-    # --- Get index LTP ---
-    spot_symbol = f"NSE:{index}"
-    ltp = kite_client.ltp(spot_symbol).get(spot_symbol, {}).get("last_price")
-    if not ltp:
-        logger.warning(f"OPTION RESOLVE FAILED | no LTP | {index}")
-        return None
+    step = get_strike_step(index, instrument_cache)
+    atm = round(ltp / step) * step
 
-    step = STRIKE_STEP[index]
-    atm_strike = round(ltp / step) * step
-
-    # --- Determine shift count ---
-    shift = 0
-    for pos in open_positions.values():
-        if pos["index"] == index and pos["direction"] == direction:
-            shift += 1
-
-    strike = atm_strike + (shift * step if direction == "LONG" else -shift * step)
+    used_strikes = {
+        p["strike"]
+        for p in positions.values()
+        if p["index"] == index and p["direction"] == direction and p["open"]
+    }
 
     option_type = "CE" if direction == "LONG" else "PE"
 
-    # --- Filter instruments ---
     candidates = [
         i for i in instrument_cache
         if i["segment"] == "NFO-OPT"
         and i["name"] == index
         and i["instrument_type"] == option_type
-        and i["strike"] == strike
-        and (i["expiry"] - i["expiry"].__class__.today()).days >= min_expiry_days
+        and (i["expiry"] - date.today()).days >= min_expiry_days
     ]
 
-    if not candidates:
-        logger.warning(
-            f"OPTION RESOLVE FAILED | {index} {direction} | strike={strike}"
-        )
-        return None
+    candidates.sort(key=lambda x: (x["expiry"], abs(x["strike"] - atm)))
 
-    candidates.sort(key=lambda x: x["expiry"])
-    return candidates[0]
+    for c in candidates:
+        if c["strike"] not in used_strikes:
+            return c
+
+    return None
