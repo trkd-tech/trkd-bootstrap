@@ -6,20 +6,21 @@ VWAP Crossover strategy.
 Entry Logic (5-minute candles):
 - Candle closes ABOVE VWAP and previous candle closed BELOW VWAP → LONG
 - Candle closes BELOW VWAP and previous candle closed ABOVE VWAP → SHORT
-- Time filters:
-    - Hard floor: not before 09:45
-    - Must be >= trade_after (config)
-    - Must be <= trade_before (config)
+- Time filter:
+    - Not before 09:45 (hard floor)
+    - Must be >= trade_after (user config)
+    - Must be <= trade_before (user config)
 - Direction filter: UP / DOWN / BOTH
-- Per-day trade limits enforced per strategy × index × direction
+- Per-direction trade limits enforced per strategy × index × day
 
 Exit Logic:
 - Reverse VWAP crossover (handled elsewhere)
-- Time exits handled by risk engine
-- Trailing SL handled by risk engine
+- Time-based exits handled elsewhere
+- Trailing SL handled elsewhere
 
 This module MUST:
 - Not place trades
+- Not manage positions
 - Only emit strategy signals
 """
 
@@ -39,6 +40,34 @@ HARD_START = datetime.strptime("09:45", "%H:%M").time()
 #     "LONG": int,
 #     "SHORT": int
 # }
+
+# ============================================================
+# INTERNAL HELPERS
+# ============================================================
+
+def _get_trade_limit(config, base_key, index):
+    """
+    Resolve per-strategy × index trade limit.
+
+    Priority:
+    1. max_trades_per_day_<long|short>_<index>_<strategy>
+    2. max_trades_per_day_<long|short>_<index>
+    3. max_trades_per_day_<long|short>
+    4. default = 1
+    """
+    if index:
+        index = index.lower()
+        strategy = STRATEGY_NAME.lower()
+
+        k1 = f"{base_key}_{index}_{strategy}"
+        if k1 in config:
+            return int(config[k1])
+
+        k2 = f"{base_key}_{index}"
+        if k2 in config:
+            return int(config[k2])
+
+    return int(config.get(base_key, 1))
 
 # ============================================================
 # CORE EVALUATION
@@ -67,14 +96,11 @@ def evaluate_vwap_crossover(
         }
     """
 
-    # --------------------------------------------------------
-    # SAFETY CHECKS
-    # --------------------------------------------------------
-
+    # --- Safety checks ---
     if not prev_candle:
         return None
 
-    # Ensure sequential 5-minute candles
+    # Ensure candles are sequential (5-minute gap)
     if candle["start"] - prev_candle["start"] != timedelta(minutes=5):
         return None
 
@@ -85,19 +111,15 @@ def evaluate_vwap_crossover(
     if not index:
         return None
 
+    # --- Time filters ---
     t = candle["start"].time()
 
     trade_after = datetime.strptime(
         config.get("trade_after", "09:45"), "%H:%M"
     ).time()
-
     trade_before = datetime.strptime(
         config.get("trade_before", "15:00"), "%H:%M"
     ).time()
-
-    # --------------------------------------------------------
-    # TIME FILTERS
-    # --------------------------------------------------------
 
     if t < HARD_START or t < trade_after or t > trade_before:
         return None
@@ -110,44 +132,26 @@ def evaluate_vwap_crossover(
         {"date": today, "LONG": 0, "SHORT": 0}
     )
 
-    # --------------------------------------------------------
-    # DAILY RESET
-    # --------------------------------------------------------
-
+    # --- Reset per IST day ---
     if strat_state["date"] != today:
         strat_state["date"] = today
         strat_state["LONG"] = 0
         strat_state["SHORT"] = 0
 
-    # --------------------------------------------------------
-    # TRADE LIMITS (strategy × index × direction)
-    # --------------------------------------------------------
-
-    max_long = _get_trade_limit(
-        config,
-        base_key="max_trades_per_day_long",
-        index=index,
-        strategy=STRATEGY_NAME
-    )
-
-    max_short = _get_trade_limit(
-        config,
-        base_key="max_trades_per_day_short",
-        index=index,
-        strategy=STRATEGY_NAME
-    )
-
-    allowed_dir = config.get("direction", "BOTH")
-
     prev_close = prev_candle["close"]
     close = candle["close"]
     vwap = vwap_state[token]["vwap"]
 
-    signal = None
+    allowed_dir = config.get("direction", "BOTH")
 
-    # --------------------------------------------------------
-    # SIGNAL LOGIC
-    # --------------------------------------------------------
+    max_long = _get_trade_limit(
+        config, "max_trades_per_day_long", index
+    )
+    max_short = _get_trade_limit(
+        config, "max_trades_per_day_short", index
+    )
+
+    signal = None
 
     # --- LONG crossover ---
     if (
@@ -156,8 +160,8 @@ def evaluate_vwap_crossover(
         allowed_dir in ("UP", "BOTH") and
         strat_state["LONG"] < max_long
     ):
-        signal = "LONG"
         strat_state["LONG"] += 1
+        signal = "LONG"
 
     # --- SHORT crossover ---
     elif (
@@ -166,16 +170,16 @@ def evaluate_vwap_crossover(
         allowed_dir in ("DOWN", "BOTH") and
         strat_state["SHORT"] < max_short
     ):
-        signal = "SHORT"
         strat_state["SHORT"] += 1
+        signal = "SHORT"
 
     if not signal:
         return None
 
     logger.info(
         f"VWAP CROSS SIGNAL | token={token} | index={index} | "
-        f"{signal} | close={close} | "
-        f"VWAP={round(vwap, 2)} | time={t}"
+        f"{signal} | close={close} | VWAP={round(vwap,2)} | "
+        f"time={candle['start'].time()}"
     )
 
     return {
@@ -185,41 +189,3 @@ def evaluate_vwap_crossover(
         "price": close,
         "time": candle["start"]
     }
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def _get_trade_limit(config, base_key, index, strategy):
-    """
-    Resolve trade limits in the following priority order:
-
-    1. max_trades_per_day_<direction>_<index>_<strategy>
-       e.g. max_trades_per_day_long_nifty_vwap_crossover
-
-    2. max_trades_per_day_<direction>_<strategy>
-       e.g. max_trades_per_day_long_vwap_crossover
-
-    3. max_trades_per_day_<direction>
-       e.g. max_trades_per_day_long
-
-    4. Default = 1
-    """
-
-    index = index.lower()
-    strategy = strategy.lower()
-
-    keys = [
-        f"{base_key}_{index}_{strategy}",
-        f"{base_key}_{strategy}",
-        f"{base_key}",
-    ]
-
-    for key in keys:
-        if key in config:
-            try:
-                return int(config[key])
-            except (TypeError, ValueError):
-                pass
-
-    return 1
