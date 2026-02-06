@@ -7,10 +7,10 @@ logger = logging.getLogger(__name__)
 
 def sync_positions_from_kite(kite_client, positions):
     """
-    Sync runtime positions with Kite positions.
+    Sync runtime positions with Kite net positions.
 
     Kite is the source of truth.
-    If a runtime position is no longer present at Kite → mark closed.
+    If a runtime position is missing at Kite → mark closed.
     """
 
     try:
@@ -22,7 +22,7 @@ def sync_positions_from_kite(kite_client, positions):
     kite_open = {
         p["tradingsymbol"]: p
         for p in kite_positions
-        if p["quantity"] != 0
+        if p.get("quantity", 0) != 0
     }
 
     for key, pos in list(positions.items()):
