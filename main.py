@@ -36,6 +36,22 @@ from execution.paper import enter_position, exit_position
 from risk.exits import evaluate_exits
 from state import token_meta, vwap_state, opening_range, positions, strategy_state
 
+def log_atm_option_price(signal):
+    index = token_meta.get(signal["token"], {}).get("index")
+    if not index:
+        return None, None
+
+    trading_symbol, ltp = get_atm_option_ltp(index, signal["direction"])
+    if not trading_symbol or ltp is None:
+        return None, None
+
+    logger.info(
+        f"ATM OPTION | index={index} | "
+        f"signal={signal['direction']} | "
+        f"symbol={trading_symbol} | "
+        f"ltp={ltp}"
+    )
+    return trading_symbol, ltp
 # ============================================================
 # LOGGING
 # ============================================================
@@ -175,11 +191,12 @@ def start_background_engine():
 
     gspread_client = bootstrap_checks()
 
-    kite = KiteConnect(os.getenv("KITE_API_KEY"))
-    kite.set_access_token(os.getenv("KITE_ACCESS_TOKEN"))
+    kite_client = KiteConnect(os.getenv("KITE_API_KEY"))
+    kite_client.set_access_token(os.getenv("KITE_ACCESS_TOKEN"))
 
-    nifty = resolve_current_month_fut(kite, "NIFTY")
-    banknifty = resolve_current_month_fut(kite, "BANKNIFTY")
+    instrument_cache = kite_client.instruments("NFO")
+    nifty = resolve_current_month_fut(kite_client, "NIFTY")
+    banknifty = resolve_current_month_fut(kite_client, "BANKNIFTY")
 
     token_meta[nifty] = {"index": "NIFTY"}
     token_meta[banknifty] = {"index": "BANKNIFTY"}
