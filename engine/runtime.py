@@ -18,6 +18,7 @@ import logging
 from datetime import timedelta
 
 from engine.strategy_router import route_strategies
+from data.time_utils import normalize_ist_naive
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 candles_1m = {}
 candles_5m = {}
 last_minute_seen = {}
+last_cum_volume = {}
 
 # ============================================================
 # TICK → 1M
@@ -48,8 +50,20 @@ def process_tick_to_1m(
         return
 
     token = tick["instrument_token"]
-    ts = tick["exchange_timestamp"].replace(second=0, microsecond=0)
+    ts = normalize_ist_naive(tick["exchange_timestamp"]).replace(second=0, microsecond=0)
     price = tick["last_price"]
+
+    cum_vol = tick.get("volume_traded")
+    if cum_vol is None:
+        return
+
+    prev_cum = last_cum_volume.get(token)
+    if prev_cum is None:
+        delta_vol = 0
+    else:
+        delta_vol = max(cum_vol - prev_cum, 0)
+
+    last_cum_volume[token] = cum_vol
 
     candle = candles_1m.setdefault((token, ts), {
         "start": ts,
@@ -63,7 +77,7 @@ def process_tick_to_1m(
     candle["high"] = max(candle["high"], price)
     candle["low"] = min(candle["low"], price)
     candle["close"] = price
-    candle["volume"] = tick.get("volume_traded", candle["volume"])
+    candle["volume"] += delta_vol
 
     last = last_minute_seen.get(token)
     if last and ts > last:

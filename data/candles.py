@@ -21,6 +21,8 @@ Downstream consumers:
 
 from datetime import timedelta
 
+from data.time_utils import normalize_ist_naive
+
 # ============================================================
 # STATE (owned by data layer)
 # ============================================================
@@ -33,6 +35,9 @@ candles_5m = {}
 
 # token -> last seen minute (datetime)
 last_minute_seen = {}
+
+# token -> last cumulative volume
+last_cum_volume = {}
 
 # ============================================================
 # 1-MIN CANDLE BUILDER
@@ -53,9 +58,21 @@ def process_tick_to_1m(tick):
 
     # IMPORTANT:
     # Kite exchange_timestamp is already IST.
-    minute = tick["exchange_timestamp"].replace(second=0, microsecond=0)
+    minute = normalize_ist_naive(tick["exchange_timestamp"]).replace(second=0, microsecond=0)
 
     key = (token, minute)
+
+    cum_vol = tick.get("volume_traded")
+    if cum_vol is None:
+        return
+
+    prev_cum = last_cum_volume.get(token)
+    if prev_cum is None:
+        delta_vol = 0
+    else:
+        delta_vol = max(cum_vol - prev_cum, 0)
+
+    last_cum_volume[token] = cum_vol
 
     candle = candles_1m.get(key)
     if candle is None:
@@ -65,14 +82,14 @@ def process_tick_to_1m(tick):
             "high": price,
             "low": price,
             "close": price,
-            "volume": tick.get("volume_traded", 0),
+            "volume": delta_vol,
         }
         candles_1m[key] = candle
     else:
         candle["high"] = max(candle["high"], price)
         candle["low"] = min(candle["low"], price)
         candle["close"] = price
-        candle["volume"] = tick.get("volume_traded", candle["volume"])
+        candle["volume"] += delta_vol
 
     detect_minute_close(token, minute)
 

@@ -17,6 +17,8 @@ This module MUST:
 import logging
 from datetime import datetime
 
+from data.time_utils import now_ist
+
 logger = logging.getLogger(__name__)
 
 # ============================================================
@@ -101,3 +103,27 @@ def load_strategy_config(gspread_client, sheet_id):
         )
 
     return config
+
+
+_cached_config = {}
+_last_loaded_date = None
+
+
+def get_strategy_config(
+    gspread_client,
+    sheet_id,
+    *,
+    force_reload=False
+):
+    """
+    Load strategy config once per IST day unless force_reload is True.
+    """
+    global _cached_config, _last_loaded_date
+
+    today = now_ist().date()
+
+    if force_reload or _last_loaded_date != today:
+        _cached_config = load_strategy_config(gspread_client, sheet_id)
+        _last_loaded_date = today
+
+    return _cached_config
