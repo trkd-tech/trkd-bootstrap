@@ -48,6 +48,7 @@ def route_strategies(
     prev_candle,
     vwap_state,
     opening_range,
+    token_meta,
     strategy_state,
     strategy_config
 ):
@@ -56,12 +57,13 @@ def route_strategies(
 
     Args:
         token: instrument token
-        candle: current completed candle (dict)
-        prev_candle: previous candle of same timeframe or None
+        candle: completed candle dict
+        prev_candle: previous candle or None
         vwap_state: shared VWAP state
-        opening_range: shared OR state
+        opening_range: shared Opening Range state
+        token_meta: token → {index, ...}
         strategy_state: mutable per-strategy state
-        strategy_config: dict loaded from config_loader
+        strategy_config: dict loaded from STRATEGY_CONFIG sheet
 
     Returns:
         List of emitted signals (possibly empty)
@@ -69,7 +71,12 @@ def route_strategies(
 
     signals = []
 
+    if not strategy_config:
+        return signals
+
     for strategy_name, config in strategy_config.items():
+
+        # --- Strategy enable flag ---
         if not config.get("enabled", False):
             continue
 
@@ -81,24 +88,26 @@ def route_strategies(
             continue
 
         try:
-            # --- ORB ---
+            # --- ORB Strategy ---
             if strategy_name == ORB_NAME:
                 signal = evaluator(
                     token=token,
                     candle=candle,
                     vwap_state=vwap_state,
                     opening_range=opening_range,
+                    token_meta=token_meta,
                     strategy_state=strategy_state,
                     config=config
                 )
 
-            # --- VWAP CROSSOVER ---
+            # --- VWAP Crossover Strategy ---
             elif strategy_name == VWAP_CROSS_NAME:
                 signal = evaluator(
                     token=token,
                     candle=candle,
                     prev_candle=prev_candle,
                     vwap_state=vwap_state,
+                    token_meta=token_meta,
                     strategy_state=strategy_state,
                     config=config
                 )
