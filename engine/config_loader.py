@@ -107,6 +107,8 @@ def load_strategy_config(gspread_client, sheet_id):
 
 _cached_config = {}
 _last_loaded_date = None
+_cached_exec_config = {}
+_last_exec_loaded_date = None
 
 
 def get_strategy_config(
