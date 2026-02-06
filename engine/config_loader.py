@@ -1,12 +1,13 @@
 """
-config_loader.py
+engine/config_loader.py
 
 Loads configuration from Google Sheets.
 
 Responsibilities:
-- Load per-strategy parameters (STRATEGY_CONFIG)
-- Load per-strategy × index execution mode (STRATEGY_EXECUTION)
-- Load global system flags (SYSTEM_CONTROL)
+- Load STRATEGY_CONFIG (strategy parameters)
+- Load STRATEGY_EXECUTION (paper/live/off + qty)
+- Load SYSTEM_CONTROL (global runtime switches)
+- Parse values into correct Python types
 - Cache configs once per IST day
 
 This module MUST:
@@ -23,14 +24,14 @@ from data.time_utils import now_ist
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# INTERNAL CACHE (per IST day)
+# INTERNAL CACHE
 # ============================================================
 
-_cached_config = {}
-_last_loaded_date = None
+_cached_strategy_config = {}
+_last_strategy_loaded_date = None
 
-_cached_exec_config = {}
-_last_exec_loaded_date = None
+_cached_execution_config = {}
+_last_execution_loaded_date = None
 
 _cached_system_control = {}
 _last_system_control_date = None
@@ -77,12 +78,18 @@ def parse_value(value):
 
 def load_strategy_config(gspread_client, sheet_id):
     """
-    Load per-strategy configuration from STRATEGY_CONFIG sheet.
+    Load STRATEGY_CONFIG sheet.
+
+    Expected columns:
+    - strategy_name
+    - enabled
+    - param
+    - value
 
     Returns:
         dict[strategy_name] = {
             "enabled": bool,
-            param_name: value,
+            param_name: parsed_value,
             ...
         }
     """
@@ -109,24 +116,33 @@ def load_strategy_config(gspread_client, sheet_id):
             strat_cfg[param] = parse_value(value)
 
     for strat, cfg in config.items():
-        logger.info(f"STRATEGY CONFIG LOADED | {strat} | params={cfg}")
+        logger.info(
+            f"STRATEGY CONFIG LOADED | {strat} | params={cfg}"
+        )
 
     return config
 
 
-def get_strategy_config(gspread_client, sheet_id, *, force_reload=False):
+def get_strategy_config(
+    gspread_client,
+    sheet_id,
+    *,
+    force_reload=False
+):
     """
-    Load strategy config once per IST day unless force_reload=True.
+    Cached STRATEGY_CONFIG (once per IST day).
     """
-    global _cached_config, _last_loaded_date
+    global _cached_strategy_config, _last_strategy_loaded_date
 
     today = now_ist().date()
 
-    if force_reload or _last_loaded_date != today:
-        _cached_config = load_strategy_config(gspread_client, sheet_id)
-        _last_loaded_date = today
+    if force_reload or _last_strategy_loaded_date != today:
+        _cached_strategy_config = load_strategy_config(
+            gspread_client, sheet_id
+        )
+        _last_strategy_loaded_date = today
 
-    return _cached_config
+    return _cached_strategy_config
 
 # ============================================================
 # EXECUTION CONFIG (Paper / Live / Off)
@@ -140,13 +156,18 @@ def _normalize_mode(value):
 
 def load_execution_config(gspread_client, sheet_id):
     """
-    Load per-strategy × index execution configuration.
+    Load STRATEGY_EXECUTION sheet.
 
-    Sheet: STRATEGY_EXECUTION
+    Expected columns:
+    - strategy_name
+    - index (NIFTY / BANKNIFTY)
+    - mode (PAPER / LIVE / OFF)
+    - qty
+    - enabled
 
     Returns:
         dict[(strategy_name, index)] = {
-            "mode": "LIVE" | "PAPER" | "OFF",
+            "mode": str,
             "qty": int,
             "enabled": bool
         }
@@ -165,21 +186,23 @@ def load_execution_config(gspread_client, sheet_id):
         enabled = row.get("enabled")
 
         if not strategy or not index:
-            logger.warning(f"EXEC CONFIG INVALID ROW | missing strategy/index | row={row}")
             continue
 
         if mode not in {"LIVE", "PAPER", "OFF"}:
-            logger.warning(f"EXEC CONFIG INVALID MODE | {strategy} | {index} | mode={mode}")
+            logger.warning(
+                f"EXEC CONFIG INVALID MODE | {strategy} | {index} | mode={mode}"
+            )
             continue
 
         try:
             qty = int(qty)
         except (TypeError, ValueError):
-            logger.warning(f"EXEC CONFIG INVALID QTY | {strategy} | {index} | qty={qty}")
+            logger.warning(
+                f"EXEC CONFIG INVALID QTY | {strategy} | {index} | qty={qty}"
+            )
             continue
 
         if qty <= 0:
-            logger.warning(f"EXEC CONFIG INVALID QTY | {strategy} | {index} | qty={qty}")
             continue
 
         config[(strategy, index)] = {
@@ -197,19 +220,26 @@ def load_execution_config(gspread_client, sheet_id):
     return config
 
 
-def get_execution_config(gspread_client, sheet_id, *, force_reload=False):
+def get_execution_config(
+    gspread_client,
+    sheet_id,
+    *,
+    force_reload=False
+):
     """
-    Load execution config once per IST day unless force_reload=True.
+    Cached STRATEGY_EXECUTION (once per IST day).
     """
-    global _cached_exec_config, _last_exec_loaded_date
+    global _cached_execution_config, _last_execution_loaded_date
 
     today = now_ist().date()
 
-    if force_reload or _last_exec_loaded_date != today:
-        _cached_exec_config = load_execution_config(gspread_client, sheet_id)
-        _last_exec_loaded_date = today
+    if force_reload or _last_execution_loaded_date != today:
+        _cached_execution_config = load_execution_config(
+            gspread_client, sheet_id
+        )
+        _last_execution_loaded_date = today
 
-    return _cached_exec_config
+    return _cached_execution_config
 
 # ============================================================
 # SYSTEM CONTROL
@@ -217,23 +247,28 @@ def get_execution_config(gspread_client, sheet_id, *, force_reload=False):
 
 def load_system_control(gspread_client, sheet_id):
     """
-    Load SYSTEM_CONTROL sheet into a key/value dict.
+    Load SYSTEM_CONTROL sheet into key/value dict.
 
-    Tolerant of column names:
-    - key / param / name
-    - value / enabled / flag
+    Accepts flexible column naming.
     """
     sh = gspread_client.open_by_key(sheet_id)
     ws = sh.worksheet("SYSTEM_CONTROL")
-    rows = ws.get_all_records()
 
+    rows = ws.get_all_records()
     control = {}
+
     key_fields = ("key", "param", "name")
     value_fields = ("value", "enabled", "flag")
 
     for row in rows:
-        key = next((row.get(k) for k in key_fields if row.get(k) is not None), None)
-        value = next((row.get(v) for v in value_fields if row.get(v) is not None), None)
+        key = next(
+            (row.get(k) for k in key_fields if row.get(k) is not None),
+            None
+        )
+        value = next(
+            (row.get(v) for v in value_fields if row.get(v) is not None),
+            None
+        )
 
         if key is None:
             continue
@@ -241,20 +276,26 @@ def load_system_control(gspread_client, sheet_id):
         control[str(key).strip()] = parse_value(value)
 
     logger.info(f"SYSTEM CONTROL LOADED | keys={list(control.keys())}")
-
     return control
 
 
-def get_system_control(gspread_client, sheet_id, *, force_reload=False):
+def get_system_control(
+    gspread_client,
+    sheet_id,
+    *,
+    force_reload=False
+):
     """
-    Load system control once per IST day unless force_reload=True.
+    Cached SYSTEM_CONTROL (once per IST day).
     """
     global _cached_system_control, _last_system_control_date
 
     today = now_ist().date()
 
     if force_reload or _last_system_control_date != today:
-        _cached_system_control = load_system_control(gspread_client, sheet_id)
+        _cached_system_control = load_system_control(
+            gspread_client, sheet_id
+        )
         _last_system_control_date = today
 
     return _cached_system_control
