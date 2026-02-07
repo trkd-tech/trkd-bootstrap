@@ -1,84 +1,69 @@
-"""
-execution/option_resolver.py
-
-Resolves option contracts for live execution.
-
-Responsibilities:
-- ATM & shifted strikes
-- Expiry filtering
-- Avoid strike collisions across strategies
-"""
 # execution/option_resolver.py
 
-from datetime import date
+from datetime import timedelta, date
+import logging
 
-# ============================================================
-# STRIKE STEP DISCOVERY
-# ============================================================
-
-def get_strike_step(index, instrument_cache):
-    strikes = sorted({
-        i["strike"]
-        for i in instrument_cache
-        if i["segment"] == "NFO-OPT"
-        and i["name"] == index
-    })
-
-    if len(strikes) < 2:
-        raise RuntimeError(f"Cannot determine strike step for {index}")
-
-    return strikes[1] - strikes[0]
+logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# OPTION RESOLUTION
-# ============================================================
-
-def resolve_option(
+def resolve_option_for_signal(
     *,
-    index,
-    direction,
-    kite_client,
+    kite,
     instrument_cache,
+    signal,
     positions,
-    min_expiry_days
+    token_meta,
+    config
 ):
     """
-    Resolve an option instrument respecting:
-    - ATM proximity
-    - Strike conflicts with other strategies
-    - Minimum expiry days
+    Resolve an option instrument for a signal:
+    - ATM base
+    - Shift strike if conflict
+    - Enforce min expiry days
     """
 
+    index = token_meta.get(signal["token"], {}).get("index")
+    if not index:
+        return None
+
+    min_expiry_days = int(config.get("min_expiry_days", 7))
+    direction = signal["direction"]
+
+    # --- Fetch index LTP ---
     ltp_symbol = f"NSE:{index}"
-    ltp = kite_client.ltp(ltp_symbol)[ltp_symbol]["last_price"]
+    ltp = kite.ltp(ltp_symbol)[ltp_symbol]["last_price"]
 
-    step = get_strike_step(index, instrument_cache)
-    atm = round(ltp / step) * step
-
+    # --- Collect used strikes ---
     used_strikes = {
         pos["strike"]
         for pos in positions.values()
-        if pos["index"] == index
-        and pos["direction"] == direction
-        and pos["open"]
+        if pos["index"] == index and pos["open"]
     }
 
-    option_type = "CE" if direction == "LONG" else "PE"
-
+    # --- Candidate options ---
     candidates = [
         i for i in instrument_cache
         if i["segment"] == "NFO-OPT"
         and i["name"] == index
-        and i["instrument_type"] == option_type
-        and (i["expiry"] - date.today()).days >= min_expiry_days
+        and i["expiry"] >= date.today() + timedelta(days=min_expiry_days)
+        and (
+            (direction == "LONG" and i["instrument_type"] == "CE") or
+            (direction == "SHORT" and i["instrument_type"] == "PE")
+        )
     ]
 
-    # Closest expiry first, then closest strike
-    candidates.sort(key=lambda x: (x["expiry"], abs(x["strike"] - atm)))
+    if not candidates:
+        logger.warning("NO OPTIONS | expiry constraint failed")
+        return None
 
-    for c in candidates:
-        if c["strike"] not in used_strikes:
-            return c
+    # --- Sort by expiry then ATM distance ---
+    candidates.sort(
+        key=lambda x: (x["expiry"], abs(x["strike"] - ltp))
+    )
 
+    for opt in candidates:
+        if opt["strike"] not in used_strikes:
+            return opt
+
+    logger.warning("NO FREE STRIKE | all strikes occupied")
     return None
