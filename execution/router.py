@@ -1,77 +1,61 @@
-"""
-execution/router.py
-
-Routes strategy signals to LIVE or PAPER execution engines
-based on per-strategy × index configuration.
-"""
+# execution/router.py
 
 import logging
-from execution.option_resolver import resolve_option
 
 logger = logging.getLogger(__name__)
 
 
 def route_signal(
     signal,
+    *,
     token_meta,
     execution_config,
-    *,
     paper_engine,
     live_engine,
-    live_trading_enabled,
-    kite_client,
-    instrument_cache,
-    positions
+    live_trading_enabled
 ):
-    strategy = signal["strategy"]
-    token = signal["token"]
-    direction = signal["direction"]
+    """
+    Decide how (or if) a signal is executed.
+    """
 
-    index = token_meta.get(token, {}).get("index")
+    index = token_meta.get(signal["token"], {}).get("index")
     if not index:
+        logger.warning("EXEC SKIP | unknown index")
         return
 
-    exec_cfg = execution_config.get((strategy, index))
-    if not exec_cfg or not exec_cfg.get("enabled"):
+    exec_key = (signal["strategy"], index)
+    cfg = execution_config.get(exec_key)
+
+    if not cfg or not cfg.get("enabled", False):
+        logger.info("EXEC SKIP | execution disabled")
         return
 
-    mode = exec_cfg["mode"]
-    qty = exec_cfg["qty"]
-    min_expiry_days = exec_cfg.get("min_expiry_days", 7)
+    mode = cfg.get("mode")
+    qty = cfg.get("qty", 0)
 
-    # =========================
-    # PAPER MODE
-    # =========================
-    if mode == "PAPER":
-        paper_engine.enter_position(
-            token=token,
-            signal=signal,
-            qty=qty
-        )
+    if qty <= 0 or mode == "OFF":
         return
 
-    # =========================
-    # LIVE MODE
-    # =========================
-    if mode == "LIVE" and live_trading_enabled:
-        option = resolve_option(
-            index=index,
-            direction=direction,
-            kite_client=kite_client,
-            instrument_cache=instrument_cache,
-            positions=positions,
-            min_expiry_days=min_expiry_days
-        )
+    if mode == "LIVE":
+        if not live_trading_enabled:
+            logger.warning("LIVE BLOCKED | system kill switch")
+            return
 
+        # option must be resolved BEFORE this call
+        option = signal.get("option")
         if not option:
-            logger.warning(
-                f"NO OPTION AVAILABLE | {strategy} | {index} | {direction}"
-            )
+            logger.warning("LIVE SKIP | no option resolved")
             return
 
         live_engine.enter_position(
-            token=token,
             signal=signal,
             qty=qty,
             option=option
+        )
+
+    elif mode == "PAPER":
+        paper_engine.enter_position(
+            token=signal["token"],
+            signal=signal,
+            qty=qty
         )
